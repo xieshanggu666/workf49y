@@ -46,7 +46,11 @@ CREATE TABLE IF NOT EXISTS matches (
   reason TEXT NOT NULL DEFAULT '',
   weakness TEXT NOT NULL DEFAULT '',
   computed_at TEXT NOT NULL DEFAULT '',  -- 最近一次按策略重算的时间（最新结果）
-  strategy_id INTEGER NOT NULL DEFAULT 0 -- 重算时使用的策略版本（0=系统默认/历史数据）
+  strategy_id INTEGER NOT NULL DEFAULT 0, -- 重算时使用的策略版本（0=系统默认/历史数据）
+  weights TEXT NOT NULL DEFAULT '{}', -- 该结果实际使用的五维权重（灰度/回滚后仍可还原证据）
+  keyword_cap INTEGER NOT NULL DEFAULT 5,
+  is_canary INTEGER NOT NULL DEFAULT 0,   -- 1=该候选人命中灰度版本
+  strategy_mode TEXT NOT NULL DEFAULT 'full' -- default/full/canary
 );
 
 CREATE TABLE IF NOT EXISTS applications (
@@ -69,30 +73,52 @@ CREATE TABLE IF NOT EXISTS match_strategies (
   position_id INTEGER PRIMARY KEY,
   weights TEXT NOT NULL DEFAULT '{}', -- {skill,year,salary,edu,city} 归一化后合计为1
   keyword_cap INTEGER NOT NULL DEFAULT 5, -- 简历关键词加分上限（0=关闭）
+  active_version_id INTEGER NOT NULL DEFAULT 0, -- 当前全量生效版本（0=系统默认，区别于待审/灰度版本）
+  effective_start TEXT NOT NULL DEFAULT '',
+  effective_end TEXT NOT NULL DEFAULT '',
   published_at TEXT NOT NULL DEFAULT '',
   published_by TEXT NOT NULL DEFAULT ''
 );
 
--- 策略发布留痕，支持追溯每次重算所依据的版本
+-- 策略发布留痕与版本治理：待审/灰度/全量/过期/回滚全程保留，支持按版本追溯每次重算依据
 CREATE TABLE IF NOT EXISTS strategy_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   position_id INTEGER NOT NULL,
   weights TEXT NOT NULL DEFAULT '{}',
   keyword_cap INTEGER NOT NULL DEFAULT 5,
+  status TEXT NOT NULL DEFAULT 'full', -- pending/canary/full/expired/rolled_back/cancelled/failed
+  rollout_mode TEXT NOT NULL DEFAULT 'full', -- full/canary
+  canary_percent INTEGER NOT NULL DEFAULT 0,
+  canary_candidate_ids TEXT NOT NULL DEFAULT '[]',
+  effective_start TEXT NOT NULL DEFAULT '', -- datetime-local/中文库时间；空=立即生效
+  effective_end TEXT NOT NULL DEFAULT '',   -- 灰度窗口结束；空=长期有效
+  baseline_version_id INTEGER NOT NULL DEFAULT 0,
+  change_note TEXT NOT NULL DEFAULT '',
+  approval_task_id INTEGER NOT NULL DEFAULT 0,
+  promoted_version_id INTEGER NOT NULL DEFAULT 0,
   published_at TEXT NOT NULL DEFAULT '',
-  published_by TEXT NOT NULL DEFAULT ''
+  approved_at TEXT NOT NULL DEFAULT '',
+  published_by TEXT NOT NULL DEFAULT '',
+  rolled_back_by TEXT NOT NULL DEFAULT '',
+  rolled_back_at TEXT NOT NULL DEFAULT '',
+  rollback_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_versions_pos ON strategy_versions(position_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_versions_status ON strategy_versions(position_id, status);
 
 -- 重算批次：把策略发布/手动重算/启动迁移与每一次批量评分关联起来
 CREATE TABLE IF NOT EXISTS recalc_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  trigger_type TEXT NOT NULL, -- strategy_publish/manual/startup
+  trigger_type TEXT NOT NULL, -- strategy_publish/strategy_canary/strategy_promote/strategy_rollback/manual/startup
   scope TEXT NOT NULL,        -- position/global/startup
   position_id INTEGER NOT NULL DEFAULT 0,
   strategy_id INTEGER NOT NULL DEFAULT 0,
+  rollout_mode TEXT NOT NULL DEFAULT 'full', -- full/canary
+  canary_version_id INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'completed',
   pair_count INTEGER NOT NULL DEFAULT 0,
+  canary_count INTEGER NOT NULL DEFAULT 0,
+  baseline_count INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL DEFAULT '',
   finished_at TEXT NOT NULL DEFAULT '',
   triggered_by TEXT NOT NULL DEFAULT ''
@@ -106,6 +132,10 @@ CREATE TABLE IF NOT EXISTS recalc_items (
   candidate_id INTEGER NOT NULL,
   position_id INTEGER NOT NULL,
   strategy_id INTEGER NOT NULL DEFAULT 0,
+  weights TEXT NOT NULL DEFAULT '{}',
+  keyword_cap INTEGER NOT NULL DEFAULT 5,
+  is_canary INTEGER NOT NULL DEFAULT 0,
+  strategy_mode TEXT NOT NULL DEFAULT 'full',
   score INTEGER NOT NULL DEFAULT 0,
   dims TEXT NOT NULL DEFAULT '[]',
   reason TEXT NOT NULL DEFAULT '',
@@ -459,6 +489,39 @@ addColumn('offers', 'decided_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
 
+// 策略版本治理（旧库升级）：生效窗口、灰度范围、审批与回滚元数据
+addColumn('matches', 'weights', `TEXT NOT NULL DEFAULT '{}'`)
+addColumn('matches', 'keyword_cap', `INTEGER NOT NULL DEFAULT 5`)
+addColumn('matches', 'is_canary', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('matches', 'strategy_mode', `TEXT NOT NULL DEFAULT 'full'`)
+addColumn('match_strategies', 'active_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('match_strategies', 'effective_start', `TEXT NOT NULL DEFAULT ''`)
+addColumn('match_strategies', 'effective_end', `TEXT NOT NULL DEFAULT ''`)
+;[
+  ['status', `TEXT NOT NULL DEFAULT 'full'`],
+  ['rollout_mode', `TEXT NOT NULL DEFAULT 'full'`],
+  ['canary_percent', `INTEGER NOT NULL DEFAULT 0`],
+  ['canary_candidate_ids', `TEXT NOT NULL DEFAULT '[]'`],
+  ['effective_start', `TEXT NOT NULL DEFAULT ''`],
+  ['effective_end', `TEXT NOT NULL DEFAULT ''`],
+  ['baseline_version_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['change_note', `TEXT NOT NULL DEFAULT ''`],
+  ['approval_task_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['promoted_version_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['approved_at', `TEXT NOT NULL DEFAULT ''`],
+  ['rolled_back_by', `TEXT NOT NULL DEFAULT ''`],
+  ['rolled_back_at', `TEXT NOT NULL DEFAULT ''`],
+  ['rollback_reason', `TEXT NOT NULL DEFAULT ''`]
+].forEach(([col, ddl]) => addColumn('strategy_versions', col, ddl))
+addColumn('recalc_jobs', 'rollout_mode', `TEXT NOT NULL DEFAULT 'full'`)
+addColumn('recalc_jobs', 'canary_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_jobs', 'canary_count', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_jobs', 'baseline_count', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_items', 'weights', `TEXT NOT NULL DEFAULT '{}'`)
+addColumn('recalc_items', 'keyword_cap', `INTEGER NOT NULL DEFAULT 5`)
+addColumn('recalc_items', 'is_canary', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_items', 'strategy_mode', `TEXT NOT NULL DEFAULT 'full'`)
+
 // 危机回退同步：进行中的预约被危机处置挂起（status 复用 cancelled，crisis_suspended=1 标记），
 // 之后可在原单上「重新协商」恢复后续流程；incident_id 保留来源事件用于追溯
 addColumn('appointments', 'crisis_suspended', `INTEGER NOT NULL DEFAULT 0`)
@@ -480,6 +543,18 @@ db.prepare(`UPDATE application_events SET backfilled=1
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_app_events_live_once ON application_events(application_id, stage) WHERE backfilled=0')
 db.exec('CREATE INDEX IF NOT EXISTS idx_app_events_once ON application_events(application_id, stage, event_type)')
 
+// 并发发布保护：同职位最多一个待审版本、一个灰度版本；升级前若有开发期重复数据，保留最新一条
+db.prepare(`UPDATE strategy_versions SET status='cancelled'
+            WHERE status='pending'
+              AND id NOT IN (SELECT MAX(id) FROM strategy_versions WHERE status='pending' GROUP BY position_id)`).run()
+db.prepare(`UPDATE strategy_versions SET status='superseded'
+            WHERE status='canary'
+              AND id NOT IN (SELECT MAX(id) FROM strategy_versions WHERE status='canary' GROUP BY position_id)`).run()
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_versions_pending_once
+  ON strategy_versions(position_id) WHERE status='pending'`)
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_versions_canary_once
+  ON strategy_versions(position_id) WHERE status='canary'`)
+
 // 旧数据补齐：当前阶段快照取自该阶段正式事件（无正式事件时保持空串，由启动迁移按补录事件回填）
 db.prepare(`UPDATE applications SET stage_snapshot=COALESCE((
                 SELECT e.score_snapshot FROM application_events e
@@ -497,6 +572,41 @@ db.prepare(`UPDATE applications SET reject_from=(
                 ORDER BY e.id DESC LIMIT 1)
             WHERE stage='rejected' AND reject_from='' AND EXISTS (
                 SELECT 1 FROM application_events e WHERE e.application_id=applications.id AND e.stage='rejected')`).run()
+
+// 策略版本治理旧库迁移：历史最新发布版本视为已全量生效；评分证据补齐当时的权重/关键词上限
+db.prepare(`UPDATE strategy_versions
+            SET status='full', rollout_mode='full'
+            WHERE status NOT IN ('pending','canary','expired','rolled_back','cancelled','failed','scheduled','returned','superseded')`).run()
+db.prepare(`UPDATE strategy_versions
+            SET status='superseded'
+            WHERE status='full'
+              AND id NOT IN (SELECT MAX(id) FROM strategy_versions sv2 WHERE sv2.position_id=strategy_versions.position_id)`).run()
+db.prepare(`UPDATE strategy_versions
+            SET baseline_version_id=COALESCE((
+              SELECT MAX(p.id) FROM strategy_versions p
+              WHERE p.position_id=strategy_versions.position_id AND p.id<strategy_versions.id),0)
+            WHERE baseline_version_id=0`).run()
+db.prepare(`UPDATE match_strategies
+            SET active_version_id=(
+                  SELECT MAX(sv.id) FROM strategy_versions sv
+                  WHERE sv.position_id=match_strategies.position_id),
+                effective_start=COALESCE(NULLIF(effective_start,''), published_at)
+            WHERE active_version_id=0`).run()
+db.prepare(`UPDATE matches
+            SET weights=(SELECT weights FROM strategy_versions sv WHERE sv.id=matches.strategy_id),
+                keyword_cap=(SELECT keyword_cap FROM strategy_versions sv WHERE sv.id=matches.strategy_id),
+                strategy_mode=CASE WHEN strategy_id>0 THEN 'full' ELSE 'default' END,
+                is_canary=0
+            WHERE strategy_id>0 AND (weights IS NULL OR weights='' OR weights='{}')`).run()
+db.prepare(`UPDATE recalc_items
+            SET weights=(SELECT weights FROM strategy_versions sv WHERE sv.id=recalc_items.strategy_id),
+                keyword_cap=(SELECT keyword_cap FROM strategy_versions sv WHERE sv.id=recalc_items.strategy_id),
+                strategy_mode=CASE WHEN strategy_id>0 THEN 'full' ELSE 'default' END,
+                is_canary=0
+            WHERE strategy_id>0 AND (weights IS NULL OR weights='' OR weights='{}')`).run()
+db.prepare(`UPDATE recalc_jobs
+            SET rollout_mode='full', canary_version_id=0, canary_count=0, baseline_count=pair_count
+            WHERE rollout_mode NOT IN ('full','canary')`).run()
 
 // 系统默认匹配策略：五维权重合计 1.0，简历关键词为封顶附加分
 const DEFAULT_WEIGHTS = { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }

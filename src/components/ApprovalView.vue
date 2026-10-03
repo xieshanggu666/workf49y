@@ -10,21 +10,36 @@ const resubmitTarget = ref(null) // 待重提的任务
 const resubmitSalary = ref(0)
 const resubmitNote = ref('')
 const resubmitConclusion = ref('pass')
+const resubmitStrategy = ref({
+  rollout_mode: 'full', canary_percent: 20, canary_candidate_ids: [],
+  effective_start: '', effective_end: '', change_note: ''
+})
 const expandSteps = ref({})      // taskId -> bool 展开审批记录
 
 const STAGE_LABEL = { submitted: '投递', screening: '筛选', interview: '面试', offer: 'Offer', hired: '录用', rejected: '淘汰' }
 const TYPE_META = {
   stage_advance: { icon: '🔄', label: '候选人推进', submitRole: 'recruiter' },
   interview_conclusion: { icon: '💬', label: '面试结论', submitRole: 'interviewer' },
-  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' }
+  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' },
+  strategy_publish: { icon: '⚙️', label: '匹配策略发布', submitRole: 'recruiter' }
 }
 const STATUS_META = {
   pending: ['⏳', '审批中', 'var(--accent2)'],
-  approved: ['✅', '已通过·已生效', 'var(--green)'],
   returned: ['↩️', '已退回', 'var(--red)'],
+  approved: ['✅', '已通过·已生效', 'var(--green)'],
+  scheduled: ['🕒', '待生效', 'var(--accent)'],
   cancelled: ['🚫', '已撤销', 'var(--muted)'],
   failed: ['⚠️', '执行失败', 'var(--red)']
 }
+const fmtInput = iso => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+const fmtWindow = iso => iso ? String(iso).replace('T', ' ').slice(0, 16) : '立即'
+const positionName = id => store.positions.find(p => p.id === Number(id))?.name || `职位 #${id}`
 const STEP_ACTION = {
   submit: ['📨', '提交申请'], approve: ['✅', '审批通过'], return: ['↩️', '退回'],
   resubmit: ['🔁', '修改重提'], cancel: ['🚫', '撤销'], execute: ['⚡', '执行回写'], failed: ['⚠️', '执行失败']
@@ -50,6 +65,12 @@ function payloadSummary(t) {
   if (t.type === 'stage_advance') return `推进「${STAGE_LABEL[p.from_stage] || p.from_stage} → ${STAGE_LABEL[p.target_stage] || p.target_stage}」`
   if (t.type === 'interview_conclusion') return `「${p.round}」结论：${p.conclusion === 'pass' ? '✅ 通过' : '❌ 不通过'}`
   if (t.type === 'offer_issue') return `月薪 ¥${Number(p.salary || 0).toLocaleString()}${p.note ? ` · ${p.note}` : ''}`
+  if (t.type === 'strategy_publish') {
+    const scope = p.rollout_mode === 'canary'
+      ? `灰度 ${p.canary_candidate_ids?.length ? p.canary_candidate_ids.length + '人' : p.canary_percent + '%'}`
+      : '全量'
+    return `${positionName(p.position_id)} v${p.strategy_version_id} · ${scope} · ${fmtWindow(p.effective_start)} → ${p.effective_end ? fmtWindow(p.effective_end) : '长期'}`
+  }
   return ''
 }
 // 审批链节点展示：提交 → 各级审批；当前等待节点高亮
@@ -87,12 +108,33 @@ function openResubmit(t) {
   resubmitSalary.value = t.payload?.salary || 20000
   resubmitNote.value = t.payload?.note || ''
   resubmitConclusion.value = t.payload?.conclusion || 'pass'
+  resubmitStrategy.value = {
+    rollout_mode: t.payload?.rollout_mode || 'full',
+    canary_percent: t.payload?.canary_percent ?? 20,
+    canary_candidate_ids: [...(t.payload?.canary_candidate_ids || [])],
+    effective_start: fmtInput(t.payload?.effective_start),
+    effective_end: fmtInput(t.payload?.effective_end),
+    change_note: t.payload?.change_note || ''
+  }
 }
 function confirmResubmit() {
   const t = resubmitTarget.value
   const payload = {}
   if (t.type === 'offer_issue') { payload.salary = resubmitSalary.value; payload.note = resubmitNote.value }
   if (t.type === 'interview_conclusion') payload.conclusion = resubmitConclusion.value
+  if (t.type === 'strategy_publish') {
+    if (resubmitStrategy.value.rollout_mode === 'canary' && !resubmitStrategy.value.effective_end) {
+      store.notify('error', '灰度窗口结束时间必填')
+      return
+    }
+    Object.assign(payload, {
+      ...resubmitStrategy.value,
+      canary_candidate_ids: resubmitStrategy.value.canary_candidate_ids.map(Number)
+    })
+    store.resubmitStrategy(t.id, payload)
+    resubmitTarget.value = null
+    return
+  }
   store.resubmitApproval(t.id, payload)
   resubmitTarget.value = null
 }
@@ -104,9 +146,9 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
   <div class="approval">
     <!-- 角色权限说明：当前身份决定可发起的申请类型与可审批的节点 -->
     <div class="role-banner card">
-      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
+      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>与<b>匹配策略灰度/全量发布</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
       <span v-else-if="myRole === 'interviewer'">💬 当前身份「面试官」：可提交<b>面试结论</b>申请（通过/不通过），由招聘负责人审批后生效。</span>
-      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>与<b>Offer 发放</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
+      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>、<b>Offer 发放</b>与<b>匹配策略发布</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
     </div>
 
     <div class="stat-row">
@@ -140,8 +182,8 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
           <em class="muted">#{{ t.id }}</em>
         </div>
         <div class="t-main">
-          <b>{{ t.candidate }}</b>
-          <span class="muted">{{ t.position }} · {{ t.dept }}</span>
+          <b>{{ t.candidate || (t.type === 'strategy_publish' ? positionName(t.payload.position_id) : '') }}</b>
+          <span class="muted">{{ t.position || (t.type === 'strategy_publish' ? '匹配策略治理' : t.dept) }}</span>
           <span class="t-summary">{{ payloadSummary(t) }}</span>
         </div>
         <!-- 审批链进度：提交 → 逐级审批，当前等待节点高亮 -->
@@ -227,6 +269,26 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
             <button class="danger" :class="{ on: resubmitConclusion === 'fail' }" @click="resubmitConclusion = 'fail'">❌ 不通过</button>
           </div>
         </template>
+        <template v-else-if="resubmitTarget.type === 'strategy_publish'">
+          <label class="muted">发布方式</label>
+          <div class="acts">
+            <button class="primary" :class="{ on: resubmitStrategy.rollout_mode === 'full' }" @click="resubmitStrategy.rollout_mode = 'full'">全量发布</button>
+            <button class="succ" :class="{ on: resubmitStrategy.rollout_mode === 'canary' }" @click="resubmitStrategy.rollout_mode = 'canary'">灰度发布</button>
+          </div>
+          <template v-if="resubmitStrategy.rollout_mode === 'canary'">
+            <label class="muted">灰度比例：{{ resubmitStrategy.canary_percent }}%<input type="range" min="0" max="100" step="10" v-model.number="resubmitStrategy.canary_percent" /></label>
+            <label class="muted">指定灰度候选人
+              <select multiple v-model="resubmitStrategy.canary_candidate_ids" class="strategy-cands">
+                <option v-for="c in store.candidates" :key="c.id" :value="c.id">{{ c.id }} · {{ c.name }}</option>
+              </select>
+            </label>
+          </template>
+          <div class="strategy-window">
+            <label class="muted">生效开始<input type="datetime-local" v-model="resubmitStrategy.effective_start" /></label>
+            <label class="muted">窗口结束<input type="datetime-local" v-model="resubmitStrategy.effective_end" /></label>
+          </div>
+          <label class="muted">发布说明 / 回滚预案<input v-model="resubmitStrategy.change_note" /></label>
+        </template>
         <p class="muted" v-else>推进目标阶段不可修改，确认后将重新提交审批。</p>
         <div class="acts" style="margin-top:12px">
           <button class="primary" :disabled="busy(resubmitTarget.id)" @click="confirmResubmit">重新提交</button>
@@ -285,6 +347,8 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
 textarea { width: 100%; background: #101731; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; margin: 10px 0; }
 .sal-input { display: flex; align-items: center; gap: 8px; margin: 8px 0 12px; }
 .sal-input input { flex: 1; font-size: 17px; padding: 9px; }
+.strategy-window { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 8px 0; }
+.strategy-cands { min-height: 92px; }
 .modal-box label { display: block; margin: 8px 0 4px; font-size: 12px; }
 .modal-box input { width: 100%; }
 .modal-box .acts button.on.succ { background: var(--green); color: #06231a; }

@@ -140,6 +140,28 @@ export const useHrStore = defineStore('hr', {
       try { return await j('GET', `/positions/${pid}/strategy`) } catch (e) { this.notify('error', e.message); return null }
     },
     publishStrategy(pid, payload) { return this.api('POST', `/positions/${pid}/strategy`, payload) },
+    promoteStrategy(versionId) {
+      return this.runBusy(`strategy-promote:${versionId}`, () =>
+        this.api('POST', `/strategy-versions/${versionId}/promote`, {}, { success: '灰度版本已全量生效并重算' }))
+    },
+    rollbackStrategy(versionId, reason) {
+      return this.runBusy(`strategy-rollback:${versionId}`, () =>
+        this.api('POST', `/strategy-versions/${versionId}/rollback`, { reason }, { success: '策略已回滚，批量重算已完成' }))
+    },
+    resubmitStrategy(id, payload) {
+      return this.runBusy(`appr:${id}`, () =>
+        this.api('POST', `/approvals/${id}/resubmit`, { payload }, { success: '策略发布申请已修改重提' }))
+    },
+    sweepStrategies() {
+      return this.runBusy('strategy-sweep', async () => {
+        try {
+          const r = await j('GET', '/strategies/sweep')
+          await this.refresh()
+          this.notify('success', r.count ? `已推进 ${r.count} 个生效窗口` : '生效窗口已是最新')
+          return r
+        } catch (e) { this.notify('error', e.message); return null }
+      })
+    },
     recomputeAll(positionId) {
       return this.api('POST', '/match/recompute', positionId ? { position_id: positionId } : {})
     },

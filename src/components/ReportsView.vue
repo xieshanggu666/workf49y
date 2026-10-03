@@ -112,6 +112,30 @@ const avgSalary = computed(() => {
   const offers = store.offers.filter(o => o.status === 'accepted' || o.status === 'joined')
   return offers.length ? Math.round(offers.reduce((s, o) => s + o.salary, 0) / offers.length) : 0
 })
+
+const strategyGovernance = computed(() => {
+  const count = status => store.strategyVersions.filter(v => v.status === status).length
+  const jobs = store.recalcJobs.slice(0, 8)
+  const canaryMatches = store.matches.filter(m => m.is_canary)
+  const baselineMatches = store.matches.filter(m => !m.is_canary)
+  const avg = rows => rows.length ? Math.round(rows.reduce((s, m) => s + m.score, 0) / rows.length) : 0
+  return {
+    pending: count('pending') + count('returned') + count('scheduled'),
+    canary: count('canary'),
+    full: count('full'),
+    rolledBack: count('rolled_back'),
+    canaryPairs: canaryMatches.length,
+    canaryAvg: avg(canaryMatches),
+    baselineAvg: avg(baselineMatches),
+    totalJobs: store.recalcJobs.length,
+    totalPairs: store.recalcJobs.reduce((s, j) => s + (Number(j.pair_count) || 0), 0),
+    jobs
+  }
+})
+const triggerLabel = {
+  strategy_publish: '全量发布', strategy_canary: '灰度发布', strategy_promote: '灰度转正',
+  strategy_rollback: '策略回滚', manual: '手动重算', startup: '启动迁移'
+}
 </script>
 
 <template>
@@ -216,6 +240,30 @@ const avgSalary = computed(() => {
         <div class="muted tip">建议：若「筛选→面试」转化低，可优化职位JD与筛选标准；「Offer→录用」低则需复核薪酬竞争力与流程效率；「录用→入职」低需关注放鸽子与入职跟进。</div>
       </div>
     </div>
+
+    <div class="card governance-card">
+      <h3>🧪 策略版本治理与灰度效果</h3>
+      <div class="gov-kpis">
+        <div><em>待审/待生效</em><b>{{ strategyGovernance.pending }}</b></div>
+        <div><em>灰度中版本</em><b>{{ strategyGovernance.canary }}</b></div>
+        <div><em>全量版本</em><b>{{ strategyGovernance.full }}</b></div>
+        <div><em>累计回滚</em><b>{{ strategyGovernance.rolledBack }}</b></div>
+        <div><em>灰度命中匹配</em><b>{{ strategyGovernance.canaryPairs }}</b></div>
+        <div><em>灰度/基线均分</em><b>{{ strategyGovernance.canaryAvg }} / {{ strategyGovernance.baselineAvg }}</b></div>
+      </div>
+      <div class="job-table">
+        <div class="job-row job-head"><span>批次</span><span>触发</span><span>版本</span><span>灰度/基线</span><span>总分</span><span>状态</span></div>
+        <div class="job-row" v-for="j in strategyGovernance.jobs" :key="j.id">
+          <span>#{{ j.id }}</span>
+          <span>{{ triggerLabel[j.trigger_type] || j.trigger_type }}</span>
+          <span>{{ j.strategy_id ? `v${j.strategy_id}` : 'v0' }}</span>
+          <span>{{ j.canary_count || 0 }} / {{ j.baseline_count || j.pair_count || 0 }}</span>
+          <span>{{ j.pair_count }}</span>
+          <span>{{ j.status }}</span>
+        </div>
+      </div>
+      <div class="muted tip">报表只统计最新匹配与不可变重算批次；投递时评分和阶段评分快照仍按审批/投递当时版本统计，策略全量或回滚均不重写历史决策证据。</div>
+    </div>
   </div>
 </template>
 
@@ -268,4 +316,13 @@ const avgSalary = computed(() => {
 .kpis div.wide { grid-column: 1 / -1; }
 .kpis em { display: block; font-style: normal; font-size: 12px; }
 .kpis b { font-size: 24px; color: var(--accent); }
+.governance-card { margin-top: 0; }
+.gov-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.gov-kpis div { background: var(--panel2); border-radius: 10px; padding: 12px; text-align: center; }
+.gov-kpis em { display: block; font-style: normal; font-size: 12px; color: var(--muted); }
+.gov-kpis b { display: block; font-size: 21px; color: var(--purple); margin-top: 4px; }
+.job-table { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.job-row { display: grid; grid-template-columns: .6fr 1fr .6fr 1fr .6fr .8fr; gap: 8px; padding: 8px 10px; font-size: 12px; }
+.job-row:nth-child(odd):not(.job-head) { background: var(--panel2); }
+.job-head { background: rgba(91,140,255,.1); font-weight: 700; color: var(--accent); }
 </style>

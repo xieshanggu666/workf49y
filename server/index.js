@@ -73,7 +73,8 @@ const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hir
 const TASK_TYPES = {
   stage_advance: { label: '候选人推进', submitRole: 'recruiter' },
   interview_conclusion: { label: '面试结论', submitRole: 'interviewer' },
-  offer_issue: { label: 'Offer 发放', submitRole: 'recruiter' }
+  offer_issue: { label: 'Offer 发放', submitRole: 'recruiter' },
+  strategy_publish: { label: '匹配策略发布', submitRole: 'recruiter' }
 }
 
 // 身份解析：前端每次请求带 x-user-id；缺省回退招聘负责人，保证旧调用兼容
@@ -84,12 +85,13 @@ function currentUser(req) {
 }
 
 // 审批链规则：推进/结论为单级；Offer 发放由用人经理审批，薪资超职位带宽时自动加签招聘负责人终审
-function buildChain(type, payload, app) {
+function buildChain(type, payload, app = null) {
   if (type === 'stage_advance') return [{ role: 'hiring_manager' }]
   if (type === 'interview_conclusion') return [{ role: 'recruiter' }]
+  if (type === 'strategy_publish') return [{ role: 'hiring_manager', reason: '匹配策略影响评分、投递与阶段快照口径' }]
   if (type === 'offer_issue') {
     const chain = [{ role: 'hiring_manager' }]
-    const pos = db.prepare('SELECT salary_max FROM positions WHERE id=?').get(app.position_id)
+    const pos = app && db.prepare('SELECT salary_max FROM positions WHERE id=?').get(app.position_id)
     if (pos && num(payload.salary) > num(pos.salary_max)) {
       chain.push({ role: 'recruiter', reason: `月薪超职位带宽上限 ¥${num(pos.salary_max).toLocaleString()}，加签终审` })
     }
@@ -165,33 +167,132 @@ function normalizeWeights(input) {
   return w
 }
 
-// 读取职位已发布的策略；未配置则回退系统默认
-function getStrategy(posId) {
+// 读取职位当前全量基线策略；待审/灰度版本不会在这里替换基线，保证未命中灰度的流量口径稳定
+function getStrategy(posId, at = new Date().toISOString()) {
   const row = db.prepare('SELECT * FROM match_strategies WHERE position_id=?').get(num(posId))
-  if (!row) {
-    return { positionId: num(posId), weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP, versionId: 0, publishedAt: '', publishedBy: '', isDefault: true }
+  if (!row) return defaultStrategy(posId, 0, { publishedAt: '', publishedBy: '', isDefault: true })
+  const activeId = num(row.active_version_id)
+  const active = activeId ? db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(activeId) : null
+  // 全量版本到达失效窗口后，逻辑上回到其发布前基线；定时 sweep 负责落库和批量回滚
+  if (active && active.effective_end && at > active.effective_end && num(active.baseline_version_id) !== activeId) {
+    const baselineId = num(active.baseline_version_id)
+    const base = baselineId ? db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(baselineId) : null
+    if (base) return versionToStrategy(base, posId, { isDefault: false, status: 'expired' })
+    return defaultStrategy(posId, 0, { publishedAt: row.published_at, publishedBy: row.published_by })
   }
-  const ver = db.prepare('SELECT id FROM strategy_versions WHERE position_id=? ORDER BY id DESC LIMIT 1').get(row.position_id)
+  if (active) return versionToStrategy(active, posId, { isDefault: false })
+  return defaultStrategy(posId, 0, {
+    publishedAt: row.published_at, publishedBy: row.published_by, isDefault: !activeId
+  })
+}
+
+function defaultStrategy(posId, versionId = 0, extra = {}) {
   return {
-    positionId: row.position_id,
-    weights: normalizeWeights(parseJSON(row.weights, { ...DEFAULT_WEIGHTS })),
-    keywordCap: Math.max(0, num(row.keyword_cap, DEFAULT_KEYWORD_CAP)),
-    versionId: ver ? ver.id : 0,
-    publishedAt: row.published_at,
-    publishedBy: row.published_by,
-    isDefault: false
+    positionId: num(posId),
+    weights: { ...DEFAULT_WEIGHTS },
+    keywordCap: DEFAULT_KEYWORD_CAP,
+    versionId,
+    publishedAt: '',
+    publishedBy: '',
+    isDefault: versionId === 0,
+    status: 'default',
+    rolloutMode: 'full',
+    isCanary: false,
+    strategyMode: 'default',
+    ...extra
+  }
+}
+
+function parseStrategyVersionRow(v, posId = v?.position_id) {
+  if (!v) return null
+  return {
+    ...v,
+    position_id: num(posId),
+    keyword_cap: Math.max(0, num(v.keyword_cap, DEFAULT_KEYWORD_CAP)),
+    canary_percent: Math.max(0, Math.min(100, num(v.canary_percent))),
+    baseline_version_id: num(v.baseline_version_id),
+    approval_task_id: num(v.approval_task_id),
+    promoted_version_id: num(v.promoted_version_id),
+    weights: normalizeWeights(parseJSON(v.weights, { ...DEFAULT_WEIGHTS })),
+    canary_candidate_ids: parseJSON(v.canary_candidate_ids, []).map(x => num(x)).filter(Boolean)
   }
 }
 
 function getStrategyVersion(versionId) {
   const id = num(versionId)
   if (!id) return null
-  const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(id)
-  if (!v) return null
+  return parseStrategyVersionRow(db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(id))
+}
+
+function versionToStrategy(v, posId = v.position_id, extra = {}) {
+  const row = parseStrategyVersionRow(v, posId)
   return {
-    ...v,
-    keyword_cap: num(v.keyword_cap),
-    weights: normalizeWeights(parseJSON(v.weights, { ...DEFAULT_WEIGHTS }))
+    positionId: num(posId),
+    weights: row.weights,
+    keywordCap: row.keyword_cap,
+    versionId: row.id,
+    publishedAt: row.approved_at || row.published_at,
+    publishedBy: row.published_by,
+    isDefault: false,
+    status: row.status,
+    rolloutMode: row.rollout_mode,
+    effectiveStart: row.effective_start,
+    effectiveEnd: row.effective_end,
+    canaryPercent: row.canary_percent,
+    canaryCandidateIds: row.canary_candidate_ids,
+    isCanary: false,
+    strategyMode: row.rollout_mode === 'canary' ? 'canary' : 'full',
+    ...extra
+  }
+}
+
+function getCanaryVersion(posId, at = new Date().toISOString()) {
+  const row = db.prepare("SELECT * FROM strategy_versions WHERE position_id=? AND status='canary' ORDER BY id DESC LIMIT 1")
+    .get(num(posId))
+  if (!row) return null
+  const v = parseStrategyVersionRow(row, posId)
+  if (v.effective_end && at > v.effective_end) return null
+  return v
+}
+
+// 稳定灰度选样：显式候选人优先；否则用候选人 ID 哈希落桶，避免每次请求随机漂移
+function isCanaryCandidate(v, candidateId) {
+  const cid = num(candidateId)
+  if (!cid) return false
+  if (v.canary_candidate_ids.length) return v.canary_candidate_ids.includes(cid)
+  if (!v.canary_percent) return false
+  const bucket = (cid * 9301 + 49297) % 100
+  return bucket < v.canary_percent
+}
+
+// 单个职位×候选人的当前生效策略：灰度窗口内命中灰度则使用灰度版本，否则走全量基线/默认策略
+function resolveStrategy(posId, candidateId, at = new Date().toISOString()) {
+  const canary = getCanaryVersion(posId, at)
+  if (canary && isCanaryCandidate(canary, candidateId)) {
+    return versionToStrategy(canary, posId, { isCanary: true, strategyMode: 'canary' })
+  }
+  return getStrategy(posId, at)
+}
+
+function windowInput(v) {
+  if (v === undefined || v === null || v === '') return ''
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString()
+}
+function fmtWindow(v) {
+  if (!v) return ''
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString('zh-CN')
+}
+
+function strategyVersionSummary(v) {
+  const row = parseStrategyVersionRow(v)
+  return {
+    ...row,
+    weights: row.weights,
+    effective_start_text: fmtWindow(row.effective_start),
+    effective_end_text: fmtWindow(row.effective_end),
+    canary_candidate_ids: row.canary_candidate_ids
   }
 }
 
@@ -277,7 +378,7 @@ function computeMatch(cand, pos, strategy) {
 }
 
 // 计算评分但不落库：推荐列表浏览不隐式制造“最新结果”，避免与流程推进时看到的证据不一致
-function computePair(candId, posId, strategy = getStrategy(posId)) {
+function computePair(candId, posId, strategy = resolveStrategy(posId, candId)) {
   const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(candId)
   const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(posId)
   if (!cand || !pos) return null
@@ -290,53 +391,75 @@ function computePair(candId, posId, strategy = getStrategy(posId)) {
     keyword_cap: strategy.keywordCap,
     strategy_id: strategy.versionId,
     strategy_is_default: strategy.isDefault,
+    strategy_status: strategy.status || '',
+    strategy_mode: strategy.strategyMode || (strategy.isDefault ? 'default' : 'full'),
+    is_canary: !!strategy.isCanary,
+    effective_start: strategy.effectiveStart || '',
+    effective_end: strategy.effectiveEnd || '',
     computed_at: now()
   }
 }
 
-function createRecalcJob({ triggerType, scope, positionId = 0, strategyId = 0, triggeredBy = 'HR' }) {
+function createRecalcJob({
+  triggerType, scope, positionId = 0, strategyId = 0, triggeredBy = 'HR',
+  rolloutMode = 'full', canaryVersionId = 0
+}) {
   const stamp = ts()
-  const r = db.prepare(`INSERT INTO recalc_jobs(trigger_type,scope,position_id,strategy_id,status,pair_count,started_at,finished_at,triggered_by)
-                        VALUES(?,?,?,?,?,?,?,?,?)`)
-    .run(triggerType, scope, num(positionId), num(strategyId), 'running', 0, stamp, stamp, triggeredBy)
+  const r = db.prepare(`INSERT INTO recalc_jobs(trigger_type,scope,position_id,strategy_id,rollout_mode,canary_version_id,status,pair_count,canary_count,baseline_count,started_at,finished_at,triggered_by)
+                        VALUES(?,?,?,?,?,?, 'running', 0,0,0,?,?,?)`)
+    .run(triggerType, scope, num(positionId), num(strategyId), rolloutMode, num(canaryVersionId), stamp, stamp, triggeredBy)
   return Number(r.lastInsertRowid)
 }
 
-function completeRecalcJob(jobId, pairCount) {
-  db.prepare('UPDATE recalc_jobs SET status=?, pair_count=?, finished_at=? WHERE id=?')
-    .run('completed', pairCount, ts(), jobId)
+function completeRecalcJob(jobId, pairCount, canaryCount = 0, baselineCount = 0) {
+  db.prepare('UPDATE recalc_jobs SET status=?, pair_count=?, canary_count=?, baseline_count=?, finished_at=? WHERE id=?')
+    .run('completed', pairCount, canaryCount, baselineCount, ts(), jobId)
 }
 
-// 按职位当前已发布策略重算并落库为「最新结果」（不影响 applications/events 中的历史快照）
-function upsertMatch(candId, posId, jobId = 0) {
-  const m = computePair(candId, posId)
+// 按职位当前生效策略重算并落库为「最新结果」（不影响 applications/events 中的历史快照）
+// strategy 可显式传入全量/灰度/回滚版本；默认按候选人是否命中灰度自动解析。
+function upsertMatch(candId, posId, jobId = 0, strategy = null) {
+  const m = computePair(candId, posId, strategy || undefined)
   if (!m) return null
   const stamp = m.computed_at
   const jid = num(jobId)
+  const isCanary = m.is_canary ? 1 : 0
+  const mode = m.strategy_mode || (m.strategy_id ? 'full' : 'default')
   const existing = db.prepare('SELECT id FROM matches WHERE candidate_id=? AND position_id=?').get(candId, posId)
   if (existing) {
-    db.prepare('UPDATE matches SET score=?,dims=?,reason=?,weakness=?,computed_at=?,strategy_id=? WHERE id=?')
-      .run(m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id, existing.id)
+    db.prepare(`UPDATE matches SET score=?,dims=?,reason=?,weakness=?,computed_at=?,strategy_id=?,weights=?,keyword_cap=?,is_canary=?,strategy_mode=? WHERE id=?`)
+      .run(m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id,
+        JSON.stringify(m.weights), m.keyword_cap, isCanary, mode, existing.id)
   } else {
-    db.prepare('INSERT INTO matches(candidate_id,position_id,score,dims,reason,weakness,computed_at,strategy_id) VALUES(?,?,?,?,?,?,?,?)')
-      .run(candId, posId, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id)
+    db.prepare(`INSERT INTO matches(candidate_id,position_id,score,dims,reason,weakness,computed_at,strategy_id,weights,keyword_cap,is_canary,strategy_mode)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(candId, posId, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id,
+        JSON.stringify(m.weights), m.keyword_cap, isCanary, mode)
   }
   if (jid) {
-    db.prepare(`INSERT INTO recalc_items(job_id,candidate_id,position_id,strategy_id,score,dims,reason,weakness,computed_at)
-                VALUES(?,?,?,?,?,?,?,?,?)`)
-      .run(jid, candId, posId, m.strategy_id, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp)
+    db.prepare(`INSERT INTO recalc_items(job_id,candidate_id,position_id,strategy_id,weights,keyword_cap,is_canary,strategy_mode,score,dims,reason,weakness,computed_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(jid, candId, posId, m.strategy_id, JSON.stringify(m.weights), m.keyword_cap, isCanary, mode,
+        m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp)
   }
   return { ...m, recalc_job_id: jid }
 }
 
 // 投递/进入阶段时的评分依据快照：锁定分数、维度、理由、短板及所用策略版本，后续重算不再改变
-function buildSnapshot(candId, posId, m, extra = {}) {
-  const strategy = getStrategy(posId)
+function buildSnapshot(candId, posId, m, extra = {}, strategy = m) {
+  const resolved = strategy && Object.prototype.hasOwnProperty.call(strategy, 'weights')
+    ? strategy
+    : resolveStrategy(posId, candId)
   return {
     score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness,
-    weights: strategy.weights, keyword_cap: strategy.keywordCap,
-    strategy_id: strategy.versionId, strategy_is_default: strategy.isDefault,
-    published_at: strategy.publishedAt, published_by: strategy.publishedBy,
+    weights: resolved.weights, keyword_cap: resolved.keywordCap,
+    strategy_id: resolved.versionId, strategy_is_default: resolved.isDefault,
+    strategy_status: resolved.status || '',
+    strategy_mode: resolved.strategyMode || (resolved.isDefault ? 'default' : 'full'),
+    is_canary: !!resolved.isCanary,
+    effective_start: resolved.effectiveStart || '',
+    effective_end: resolved.effectiveEnd || '',
+    published_at: resolved.publishedAt, published_by: resolved.publishedBy,
     candidate_id: candId, position_id: posId,
     matched_at: now(),
     ...extra
@@ -346,8 +469,24 @@ function buildSnapshot(candId, posId, m, extra = {}) {
 // ---------------- 状态汇总 ----------------
 app.get('/api/state', (req, res) => {
   const positions = db.prepare('SELECT * FROM positions ORDER BY id').all().map(p => {
-    const st = db.prepare('SELECT published_at, published_by FROM match_strategies WHERE position_id=?').get(p.id)
-    return { ...p, skills: parseSkills(p.skills), strategy: st ? { published_at: st.published_at, published_by: st.published_by } : null }
+    const st = db.prepare(`SELECT ms.*,
+        (SELECT COUNT(*) FROM strategy_versions sv WHERE sv.position_id=ms.position_id AND sv.status='pending') pending_count,
+        (SELECT COUNT(*) FROM strategy_versions sv WHERE sv.position_id=ms.position_id AND sv.status='canary') canary_count
+      FROM match_strategies ms WHERE ms.position_id=?`).get(p.id)
+    const activeVersionId = st ? num(st.active_version_id) : 0
+    return {
+      ...p,
+      skills: parseSkills(p.skills),
+      strategy: st ? {
+        published_at: st.published_at,
+        published_by: st.published_by,
+        active_version_id: activeVersionId,
+        effective_start: st.effective_start,
+        effective_end: st.effective_end,
+        pending_count: num(st.pending_count),
+        canary_count: num(st.canary_count)
+      } : { active_version_id: 0, pending_count: 0, canary_count: 0 }
+    }
   })
   const candidates = db.prepare('SELECT * FROM candidates ORDER BY id').all().map(c => ({ ...c, skills: parseSkills(c.skills) }))
   const apps = db.prepare('SELECT * FROM applications ORDER BY id DESC').all()
@@ -364,17 +503,26 @@ app.get('/api/state', (req, res) => {
     }[l.change_type] || l.change_type
   }))
   const channels = db.prepare('SELECT * FROM channels ORDER BY id').all()
-  const strategyVersions = db.prepare('SELECT * FROM strategy_versions ORDER BY id DESC').all().map(v => ({
-    ...v, weights: parseJSON(v.weights, { ...DEFAULT_WEIGHTS }), keyword_cap: num(v.keyword_cap)
-  }))
+  const strategyVersions = db.prepare('SELECT * FROM strategy_versions ORDER BY id DESC').all().map(strategyVersionSummary)
   const recalcJobs = db.prepare('SELECT * FROM recalc_jobs ORDER BY id DESC').all().map(j => ({
     ...j,
     position_id: num(j.position_id),
     strategy_id: num(j.strategy_id),
-    pair_count: num(j.pair_count)
+    canary_version_id: num(j.canary_version_id),
+    pair_count: num(j.pair_count),
+    canary_count: num(j.canary_count),
+    baseline_count: num(j.baseline_count)
   }))
-  const recalcItems = db.prepare('SELECT id,job_id,candidate_id,position_id,strategy_id,score,computed_at FROM recalc_items ORDER BY id DESC LIMIT 500')
-    .all().map(i => ({ ...i, strategy_id: num(i.strategy_id), score: num(i.score) }))
+  const recalcItems = db.prepare(`SELECT id,job_id,candidate_id,position_id,strategy_id,weights,keyword_cap,is_canary,strategy_mode,score,computed_at
+      FROM recalc_items ORDER BY id DESC LIMIT 500`)
+    .all().map(i => ({
+      ...i,
+      strategy_id: num(i.strategy_id),
+      keyword_cap: num(i.keyword_cap),
+      score: num(i.score),
+      is_canary: !!i.is_canary,
+      weights: parseJSON(i.weights, {})
+    }))
   const appEvents = db.prepare('SELECT * FROM application_events ORDER BY id ASC').all().map(e => ({
     ...e,
     from_stage: e.from_stage || '',
@@ -390,14 +538,20 @@ app.get('/api/state', (req, res) => {
     ...m,
     score: num(m.score),
     dims: parseDims(m.dims, '[]'),
-    strategy_id: num(m.strategy_id)
+    strategy_id: num(m.strategy_id),
+    keyword_cap: num(m.keyword_cap, DEFAULT_KEYWORD_CAP),
+    is_canary: !!m.is_canary,
+    strategy_mode: m.strategy_mode || (num(m.strategy_id) ? 'full' : 'default'),
+    weights: parseJSON(m.weights, {}) || {}
   }))
   // 审批中心数据：任务 + 提交时固化的审批链 + 全程步骤留痕；通知按角色投递
   const users = db.prepare('SELECT * FROM users ORDER BY rowid').all()
   const approvalSteps = db.prepare('SELECT * FROM approval_steps ORDER BY id ASC').all()
   const approvals = db.prepare('SELECT * FROM approval_tasks ORDER BY id DESC').all().map(t => {
     const a = apps.find(x => x.id === t.application_id)
-    const pos = a ? positions.find(p => p.id === a.position_id) : null
+    const payload0 = parseJSON(t.payload, {})
+    const posId = a ? a.position_id : num(payload0.position_id)
+    const pos = positions.find(p => p.id === posId)
     const cand = a ? candidates.find(c => c.id === a.candidate_id) : null
     return {
       ...t,
@@ -430,6 +584,7 @@ app.get('/api/state', (req, res) => {
     const latest = mt ? {
       score: mt.score, dims: mt.dims, reason: mt.reason, weakness: mt.weakness,
       computed_at: mt.computed_at, strategy_id: mt.strategy_id,
+      strategy_mode: mt.strategy_mode, is_canary: mt.is_canary,
       recalc_job_id: latestItem?.job_id || 0,
       recalc_trigger: latestJob?.trigger_type || '',
       recalc_scope: latestJob?.scope || ''
@@ -480,67 +635,339 @@ app.post('/api/positions/:id', (req, res) => {
 })
 
 // ---------------- 按职位配置/发布匹配策略 ----------------
-// 读取某职位生效中的策略（未配置返回系统默认）
+// 读取某职位生效中的全量基线与版本治理记录（待审/灰度不计入基线）
 app.get('/api/positions/:id/strategy', (req, res) => {
   const id = num(req.params.id)
   const pos = db.prepare('SELECT id,name FROM positions WHERE id=?').get(id)
   if (!pos) return res.status(404).json({ ok: false })
-  res.json({ ok: true, position: pos, strategy: getStrategy(id), defaults: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP } })
-})
-
-// 配置并发布策略：归一化权重 → 留痕版本 → upsert 生效配置
-// body: { weights:{skill,year,salary,edu,city}, keyword_cap, reset, recalc, published_by }
-app.post('/api/positions/:id/strategy', (req, res) => {
-  const id = num(req.params.id)
-  const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(id)
-  if (!pos) return res.status(404).json({ ok: false })
-  const b = req.body || {}
-  const stamp = ts()
-  let weights, keywordCap
-  if (b.reset) {
-    weights = { ...DEFAULT_WEIGHTS }
-    keywordCap = DEFAULT_KEYWORD_CAP
-  } else {
-    weights = normalizeWeights(b.weights || {})
-    keywordCap = Math.max(0, Math.min(20, num(b.keyword_cap, DEFAULT_KEYWORD_CAP)))
-  }
-
-  const result = tx(() => {
-    const vr = db.prepare('INSERT INTO strategy_versions(position_id,weights,keyword_cap,published_at,published_by) VALUES(?,?,?,?,?)')
-      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-    const versionId = Number(vr.lastInsertRowid)
-    db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,published_at,published_by)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,published_at=excluded.published_at,published_by=excluded.published_by`)
-      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-
-    // 发布与重算在同一事务：版本、生效策略、最新分和批次明细要么同时可见，要么全部回滚
-    let jobId = 0, pairCount = 0
-    if (b.recalc !== false) {
-      jobId = createRecalcJob({ triggerType: 'strategy_publish', scope: 'position', positionId: id, strategyId: versionId, triggeredBy: b.published_by || 'HR' })
-      pairCount = recomputePosition(id, jobId)
-      completeRecalcJob(jobId, pairCount)
-    }
-    return { weights, keywordCap, versionId, jobId, pairCount }
-  })
+  const versions = db.prepare('SELECT * FROM strategy_versions WHERE position_id=? ORDER BY id DESC LIMIT 20')
+    .all().map(strategyVersionSummary)
   res.json({
     ok: true,
-    strategy: { weights, keywordCap, versionId: result.versionId, publishedAt: stamp },
-    job_id: result.jobId,
-    recalced: result.pairCount
+    position: pos,
+    strategy: getStrategy(id),
+    canary: (() => { const v = getCanaryVersion(id); return v ? versionToStrategy(v, id, { isCanary: false }) : null })(),
+    versions,
+    defaults: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP }
   })
+})
+
+// ---------------- 策略版本治理：审批 / 生效窗口 / 灰度 / 回滚 / 批量重算 ----------------
+function parseStrategyPayload(b = {}) {
+  const weights = b.reset ? { ...DEFAULT_WEIGHTS } : normalizeWeights(b.weights || {})
+  const keywordCap = Math.max(0, Math.min(20, num(b.keyword_cap, DEFAULT_KEYWORD_CAP)))
+  const rolloutMode = b.rollout_mode === 'canary' ? 'canary' : 'full'
+  const canaryPercent = rolloutMode === 'canary'
+    ? Math.max(0, Math.min(100, Math.round(num(b.canary_percent, 0))))
+    : 0
+  const canaryIds = rolloutMode === 'canary' && Array.isArray(b.canary_candidate_ids)
+    ? [...new Set(b.canary_candidate_ids.map(num).filter(Boolean))]
+    : []
+  if (rolloutMode === 'canary' && !canaryIds.length && canaryPercent <= 0) {
+    badRequest('灰度发布必须选择灰度候选人或填写大于 0 的灰度比例', 'canary_scope_required')
+  }
+  if (canaryIds.length) {
+    const exists = db.prepare('SELECT COUNT(*) c FROM candidates WHERE id IN (' + canaryIds.map(() => '?').join(',') + ')').get(...canaryIds).c
+    if (exists !== canaryIds.length) badRequest('灰度候选人不存在', 'canary_candidate_invalid')
+  }
+  const start = windowInput(b.effective_start)
+  const end = windowInput(b.effective_end)
+  if (start && end && end <= start) badRequest('生效结束时间必须晚于开始时间', 'window_invalid')
+  if (rolloutMode === 'canary' && !end && !b.allow_indefinite) badRequest('灰度版本必须设置观察窗口结束时间', 'canary_window_required')
+  return {
+    weights, keywordCap, rolloutMode, canaryPercent, canaryIds,
+    effectiveStart: start, effectiveEnd: end,
+    changeNote: String(b.change_note || '').slice(0, 500)
+  }
+}
+
+function assertNoStrategyGovernanceLock(posId) {
+  const blocked = db.prepare("SELECT id,status FROM strategy_versions WHERE position_id=? AND status IN ('pending','returned','scheduled') ORDER BY id DESC LIMIT 1").get(posId)
+  if (blocked) conflict(`该职位已有${blocked.status === 'returned' ? '被退回' : blocked.status === 'scheduled' ? '待生效' : '待审批'}策略 v${blocked.id}，请先完成、修改重提或撤销`, 'strategy_pending_exists')
+  const canary = db.prepare("SELECT id FROM strategy_versions WHERE position_id=? AND status='canary'").get(posId)
+  if (canary) conflict(`该职位存在灰度策略 v${canary.id}，请先全量、回滚或等待窗口结束`, 'strategy_canary_exists')
+}
+
+function upsertActiveStrategy(posId, v, stamp) {
+  db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,active_version_id,effective_start,effective_end,published_at,published_by)
+              VALUES(?,?,?,?,?,?,?,?)
+              ON CONFLICT(position_id) DO UPDATE SET
+                weights=excluded.weights,keyword_cap=excluded.keyword_cap,active_version_id=excluded.active_version_id,
+                effective_start=excluded.effective_start,effective_end=excluded.effective_end,
+                published_at=excluded.published_at,published_by=excluded.published_by`)
+    .run(posId, JSON.stringify(v.weights), v.keyword_cap, v.id,
+      v.effective_start || stamp, v.effective_end, stamp, v.published_by)
+}
+
+function recomputePosition(posId, jobId = 0) {
+  const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(posId)
+  if (!pos) return { pairs: 0, canary: 0, baseline: 0 }
+  const cands = db.prepare('SELECT id FROM candidates ORDER BY id').all()
+  let canary = 0
+  cands.forEach(c => {
+    const strategy = resolveStrategy(posId, c.id)
+    if (strategy.isCanary) canary++
+    upsertMatch(c.id, posId, jobId, strategy)
+  })
+  return { pairs: cands.length, canary, baseline: cands.length - canary }
+}
+
+// 固定策略重算：全量/回滚/提升时所有候选人统一使用同一版本；窗口观察或灰度发布用 recomputePosition
+function recomputePositionWithVersion(posId, jobId, versionId, mode = 'full') {
+  const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(posId)
+  if (!pos) return { pairs: 0, canary: 0, baseline: 0 }
+  const strategy = versionId ? versionToStrategy(getStrategyVersion(versionId), posId, { strategyMode: mode })
+    : defaultStrategy(posId)
+  const cands = db.prepare('SELECT id FROM candidates ORDER BY id').all()
+  cands.forEach(c => upsertMatch(c.id, posId, jobId, strategy))
+  return { pairs: cands.length, canary: 0, baseline: cands.length }
+}
+
+function activateCanaryVersion(version, { triggeredBy } = {}) {
+  const v = parseStrategyVersionRow(version)
+  const stamp = ts()
+  const jobId = createRecalcJob({
+    triggerType: 'strategy_canary', scope: 'position', positionId: v.position_id,
+    strategyId: v.id, triggeredBy: triggeredBy || v.published_by,
+    rolloutMode: 'canary', canaryVersionId: v.id
+  })
+  const counts = recomputePosition(v.position_id, jobId)
+  completeRecalcJob(jobId, counts.pairs, counts.canary, counts.baseline)
+  db.prepare(`UPDATE strategy_versions
+              SET status='canary', approved_at=COALESCE(NULLIF(approved_at,''),?)
+              WHERE id=?`).run(stamp, v.id)
+  v.status = 'canary'
+  return { jobId, ...counts }
+}
+
+function activateFullVersion(version, { triggeredBy, triggerType = 'strategy_publish' } = {}) {
+  const v = parseStrategyVersionRow(version)
+  const stamp = ts()
+  const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(v.position_id)
+  if (!pos) badRequest('职位不存在', 'position_missing')
+  // 全量生效会终止同职位灰度/待生效版本：旧版本标记为 superseded，不删除证据
+  db.prepare("UPDATE strategy_versions SET status='superseded' WHERE position_id=? AND status IN ('canary','scheduled','full') AND id<>?")
+    .run(v.position_id, v.id)
+  upsertActiveStrategy(v.position_id, v, stamp)
+  const jobId = createRecalcJob({
+    triggerType, scope: 'position', positionId: v.position_id, strategyId: v.id,
+    triggeredBy: triggeredBy || v.published_by
+  })
+  const counts = recomputePositionWithVersion(v.position_id, jobId, v.id, 'full')
+  completeRecalcJob(jobId, counts.pairs, 0, counts.pairs)
+  db.prepare(`UPDATE strategy_versions
+              SET status='full', rollout_mode='full', canary_percent=0, canary_candidate_ids='[]',
+                  approved_at=COALESCE(NULLIF(approved_at,''),?)
+              WHERE id=?`).run(stamp, v.id)
+  return { jobId, ...counts }
+}
+
+// 提交策略发布审批：仅创建 pending 版本；审批通过且到达生效窗口后才改变 matches 与基线
+app.post('/api/positions/:id/strategy', (req, res, next) => {
+  const user = currentUser(req)
+  const id = num(req.params.id)
+  const b = req.body || {}
+  try {
+    if (user.role !== 'recruiter') forbidden('匹配策略发布需由招聘负责人发起', 'role_not_allowed')
+    if (!db.prepare('SELECT id FROM positions WHERE id=?').get(id)) return res.status(404).json({ ok: false })
+    const payload = parseStrategyPayload(b)
+    const result = tx(() => {
+      assertNoStrategyGovernanceLock(id)
+      const baseline = getStrategy(id)
+      const stamp = ts()
+      const vr = db.prepare(`INSERT INTO strategy_versions(
+          position_id,weights,keyword_cap,status,rollout_mode,canary_percent,canary_candidate_ids,
+          effective_start,effective_end,baseline_version_id,change_note,published_at,published_by)
+        VALUES(?,?,?, 'pending', ?,?,?,?,?,?,?,?,?)`)
+        .run(id, JSON.stringify(payload.weights), payload.keywordCap, payload.rolloutMode,
+          payload.canaryPercent, JSON.stringify(payload.canaryIds), payload.effectiveStart,
+          payload.effectiveEnd, baseline.versionId, payload.changeNote, stamp, user.name)
+      const versionId = Number(vr.lastInsertRowid)
+      const approvalPayload = {
+        position_id: id,
+        strategy_version_id: versionId,
+        rollout_mode: payload.rolloutMode,
+        canary_percent: payload.canaryPercent,
+        canary_candidate_ids: payload.canaryIds,
+        effective_start: payload.effectiveStart,
+        effective_end: payload.effectiveEnd,
+        change_note: payload.changeNote,
+        weights: payload.weights,
+        keyword_cap: payload.keywordCap
+      }
+      const chain = buildChain('strategy_publish', approvalPayload, null)
+      const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(id)
+      const tr = db.prepare(`INSERT INTO approval_tasks(type,application_id,interview_id,offer_id,payload,chain,current_step,status,submitted_by,submitted_by_name,submitted_role,submitted_at,version)
+                             VALUES('strategy_publish',0,0,0,?,?,0,'pending',?,?,?,?,1)`)
+        .run(JSON.stringify(approvalPayload), JSON.stringify(chain), user.id, user.name, user.role, stamp)
+      const taskId = Number(tr.lastInsertRowid)
+      db.prepare('UPDATE strategy_versions SET approval_task_id=? WHERE id=?').run(taskId, versionId)
+      addStep(taskId, {
+        stepNo: -1, role: user.role, action: 'submit', actor: user,
+        note: `提交策略 v${versionId}（${payload.rolloutMode === 'canary' ? `灰度 ${payload.canaryIds.length || payload.canaryPercent + '%'}` : '全量'}）：${payload.changeNote || '无发布说明'}`
+      })
+      notify({
+        recipientRole: chain[0].role, type: 'task_submitted',
+        title: '新的匹配策略发布审批待处理',
+        body: `${user.name} 提交「${pos.name}」策略 v${versionId}，请核对生效窗口与灰度范围`,
+        taskId, appId: 0
+      })
+      return { versionId, taskId, chain }
+    })
+    res.json({ ok: true, version_id: result.versionId, task_id: result.taskId, chain: result.chain })
+  } catch (e) { next(e) }
+})
+
+// 灰度转正：复用灰度版本证据，将其提升为全量基线并重算整个职位
+app.post('/api/strategy-versions/:vid/promote', (req, res, next) => {
+  const user = currentUser(req)
+  const vid = num(req.params.vid)
+  try {
+    const out = tx(() => {
+      const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(vid)
+      if (!v) return { notFound: true }
+      if (user.role !== 'recruiter') forbidden('仅招聘负责人可将灰度策略转正', 'role_not_allowed')
+      if (v.status !== 'canary') badRequest('仅灰度中的版本可以转正', 'strategy_not_canary')
+      const blocked = db.prepare("SELECT id,status FROM strategy_versions WHERE position_id=? AND status IN ('pending','returned','scheduled') AND id<>? ORDER BY id DESC LIMIT 1")
+        .get(v.position_id, v.id)
+      if (blocked) conflict('存在待审批、退回或待生效版本，请先处理后再转正', 'strategy_pending_exists')
+      const r = activateFullVersion(v, { triggeredBy: user.name, triggerType: 'strategy_promote' })
+      db.prepare("UPDATE strategy_versions SET promoted_version_id=id WHERE id=?").run(v.id)
+      notify({
+        recipientRole: user.role, type: 'task_executed',
+        title: '灰度策略已全量生效',
+        body: `v${v.id} 已转正，批次 #${r.jobId} 完成 ${r.pairs} 组匹配重算`,
+        taskId: num(v.approval_task_id)
+      })
+      return { ok: true, ...r, version_id: v.id }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 灰度/全量回滚：恢复发布前基线并生成 strategy_rollback 批次；历史阶段/投递快照保持不变
+app.post('/api/strategy-versions/:vid/rollback', (req, res, next) => {
+  const user = currentUser(req)
+  const vid = num(req.params.vid)
+  const reason = String(req.body?.reason || '').trim()
+  try {
+    const out = tx(() => {
+      const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(vid)
+      if (!v) return { notFound: true }
+      if (user.role !== 'recruiter') forbidden('仅招聘负责人可回滚策略', 'role_not_allowed')
+      if (!reason) badRequest('策略回滚必须填写原因', 'rollback_reason_required')
+      if (!['canary', 'full', 'scheduled', 'expired'].includes(v.status)) {
+        badRequest('仅灰度中、全量中、待生效或已过期版本可以执行回滚', 'strategy_status_invalid')
+      }
+      const posId = num(v.position_id)
+      const baselineId = num(v.baseline_version_id)
+      const baseline = baselineId ? db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(baselineId) : null
+      const stamp = ts()
+      const jobId = createRecalcJob({
+        triggerType: 'strategy_rollback', scope: 'position', positionId: posId,
+        strategyId: baselineId, triggeredBy: user.name
+      })
+      const counts = recomputePositionWithVersion(posId, jobId, baselineId, 'full')
+      completeRecalcJob(jobId, counts.pairs, 0, counts.pairs)
+      if (baseline) {
+        db.prepare("UPDATE strategy_versions SET status='full' WHERE id=?").run(baselineId)
+        upsertActiveStrategy(posId, parseStrategyVersionRow(baseline), stamp)
+      } else {
+    db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,active_version_id,effective_start,effective_end,published_at,published_by)
+                VALUES(?,?,0,'','',?,?,?)
+                ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,
+                  active_version_id=0,effective_start='',effective_end='',published_at=excluded.published_at,published_by=excluded.published_by`)
+      .run(posId, JSON.stringify(DEFAULT_WEIGHTS), DEFAULT_KEYWORD_CAP, stamp, user.name)
+      }
+      db.prepare(`UPDATE strategy_versions
+                  SET status='rolled_back', rolled_back_by=?, rolled_back_at=?, rollback_reason=?
+                  WHERE id=?`).run(user.name, stamp, reason, vid)
+      db.prepare("UPDATE strategy_versions SET status='superseded' WHERE position_id=? AND status='canary' AND id<>?", posId, vid)
+      notify({
+        recipientRole: user.role, type: 'task_failed',
+        title: '匹配策略已回滚',
+        body: `v${vid} 已回滚至 ${baselineId ? 'v' + baselineId : 'v0 默认策略'}，批次 #${jobId} 已重算 ${counts.pairs} 组匹配`,
+        taskId: num(v.approval_task_id)
+      })
+      return { ok: true, version_id: vid, baseline_version_id: baselineId, job_id: jobId, ...counts }
+    })
+    if (out.notFound) return res.status(404).json({ ok: false })
+    res.json(out)
+  } catch (e) { next(e) }
+})
+
+// 生效窗口推进：定时/手动幂等扫描。scheduled 到点执行；canary 到点自动回滚到发布前基线
+function sweepStrategyWindows(at = new Date().toISOString()) {
+  const due = db.prepare(`SELECT * FROM strategy_versions
+                          WHERE (status='scheduled')
+                             OR (status='canary' AND effective_end!='' AND effective_end<=?)
+                             OR (status='full' AND effective_end!='' AND effective_end<=?)
+                          ORDER BY id`).all(at, at)
+  const out = []
+  due.forEach(raw => {
+    tx(() => {
+      const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(raw.id)
+      if (!v || !['scheduled', 'canary', 'full'].includes(v.status)) return
+      if (v.status === 'scheduled' && v.effective_start && at < v.effective_start) return
+      if (v.status === 'canary' || v.status === 'full') {
+        if (v.approval_task_id) {
+          const label = v.status === 'canary' ? '灰度观察窗口到期' : '全量生效窗口到期'
+          db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
+                      VALUES(?,-1,'recruiter','failed','system','系统窗口守护',?,?)`)
+            .run(num(v.approval_task_id), `${label}，自动回滚 v${v.id}`, ts())
+        }
+        const action = v.status === 'canary' ? 'canary_expired' : 'full_expired'
+        const reason = v.status === 'canary' ? '灰度观察窗口到期，自动回滚' : '全量生效窗口到期，自动回滚到发布前基线'
+        const r = {
+          ...{ version_id: v.id, action },
+          ...rollbackVersionInternal(v, '系统窗口守护', reason)
+        }
+        out.push(r)
+      } else {
+        const r = v.rollout_mode === 'canary'
+          ? activateCanaryVersion(v, { triggeredBy: 'system-window' })
+          : activateFullVersion(v, { triggeredBy: 'system-window', triggerType: 'strategy_publish' })
+        out.push({ version_id: v.id, action: v.rollout_mode === 'canary' ? 'canary_activated' : 'activated', ...r })
+      }
+    })
+  })
+  return out
+}
+
+// 供窗口守护在同一事务内复用回滚逻辑（不做 HTTP 权限/原因校验）
+function rollbackVersionInternal(rawV, operator, reason) {
+  const v = parseStrategyVersionRow(rawV)
+  const posId = v.position_id
+  const baselineId = v.baseline_version_id
+  const baseline = baselineId ? db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(baselineId) : null
+  const stamp = ts()
+  const jobId = createRecalcJob({
+    triggerType: 'strategy_rollback', scope: 'position', positionId: posId,
+    strategyId: baselineId, triggeredBy: operator
+  })
+  const counts = recomputePositionWithVersion(posId, jobId, baselineId, 'full')
+  completeRecalcJob(jobId, counts.pairs, 0, counts.pairs)
+  if (baseline) {
+    db.prepare("UPDATE strategy_versions SET status='full' WHERE id=?").run(baselineId)
+    upsertActiveStrategy(posId, parseStrategyVersionRow(baseline), stamp)
+  } else {
+    db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,active_version_id,effective_start,effective_end,published_at,published_by)
+                VALUES(?,?,0,'','',?,?,?)
+                ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,
+                  active_version_id=0,effective_start='',effective_end='',published_at=excluded.published_at,published_by=excluded.published_by`)
+      .run(posId, JSON.stringify(DEFAULT_WEIGHTS), DEFAULT_KEYWORD_CAP, stamp, operator)
+  }
+  db.prepare(`UPDATE strategy_versions SET status='rolled_back', rolled_back_by=?, rolled_back_at=?, rollback_reason=? WHERE id=?`)
+    .run(operator, stamp, reason, v.id)
+  return { baseline_version_id: baselineId, job_id: jobId, ...counts }
+}
+app.get('/api/strategies/sweep', (req, res) => {
+  const changed = sweepStrategyWindows()
+  res.json({ ok: true, changed, count: changed.length })
 })
 
 // ---------------- 批量重算推荐结果 ----------------
-// 单职位：全部候选人 × 该职位（含未投递候选人，保证推荐列表可用）
-function recomputePosition(posId, jobId = 0) {
-  const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(posId)
-  if (!pos) return 0
-  const cands = db.prepare('SELECT id FROM candidates').all()
-  cands.forEach(c => upsertMatch(c.id, posId, jobId))
-  return cands.length
-}
-
 app.post('/api/match/recompute', (req, res) => {
   const b = req.body || {}
   const result = tx(() => {
@@ -552,10 +979,11 @@ app.post('/api/match/recompute', (req, res) => {
       scope = 'position'
       strategyId = getStrategy(pos.id).versionId
       const jobId = createRecalcJob({ triggerType: 'manual', scope, positionId: targetPos, strategyId, triggeredBy: b.triggered_by || 'HR' })
-      pairCount = recomputePosition(targetPos, jobId)
+      const counts = recomputePosition(targetPos, jobId)
+      pairCount = counts.pairs
       posCount = 1
-      completeRecalcJob(jobId, pairCount)
-      return { ok: true, jobId, positions: posCount, pairs: pairCount }
+      completeRecalcJob(jobId, pairCount, counts.canary, counts.baseline)
+      return { ok: true, jobId, positions: posCount, pairs: pairCount, canary: counts.canary, baseline: counts.baseline }
     }
 
     const jobId = createRecalcJob({ triggerType: 'manual', scope, triggeredBy: b.triggered_by || 'HR' })
@@ -563,16 +991,24 @@ app.post('/api/match/recompute', (req, res) => {
     const posIds = db.prepare("SELECT id FROM positions WHERE status='open'").all().map(p => p.id)
     db.prepare("SELECT DISTINCT m.position_id FROM matches m JOIN positions p ON p.id=m.position_id WHERE p.status!='open'")
       .all().forEach(r => posIds.push(r.position_id))
+    let canaryCount = 0, baselineCount = 0
     posIds.forEach(pid => {
-      // 批次是全局操作，明细保留每个职位实际使用的策略版本，职位级批次元数据记录在批次明细中可查
-      pairCount += recomputePosition(pid, jobId)
+      // 批次是全局操作，明细保留每个职位实际使用的策略版本；命中灰度的候选人随当前灰度策略重算
+      const counts = recomputePosition(pid, jobId)
+      pairCount += counts.pairs
+      canaryCount += counts.canary
+      baselineCount += counts.baseline
       posCount++
     })
-    completeRecalcJob(jobId, pairCount)
-    return { ok: true, jobId, positions: posCount, pairs: pairCount }
+    completeRecalcJob(jobId, pairCount, canaryCount, baselineCount)
+    return { ok: true, jobId, positions: posCount, pairs: pairCount, canary: canaryCount, baseline: baselineCount }
   })
   if (result.notFound) return res.status(404).json({ ok: false })
-  res.json({ ok: true, positions: result.positions, pairs: result.pairs, job_id: result.jobId, recomputed_at: ts() })
+  res.json({
+    ok: true,
+    positions: result.positions, pairs: result.pairs, canary: result.canary, baseline: result.baseline,
+    job_id: result.jobId, recomputed_at: ts()
+  })
 })
 
 // ---------------- 候选人 ----------------
@@ -597,11 +1033,18 @@ app.get('/api/match/pos/:pid', (req, res) => {
   const rows = cands.map(c => {
     // 浏览推荐时实时计算；只有显式“批量重算/发布策略”才更新最新结果与审计批次
     const m = computePair(c.id, posId)
-    return { candidate_id: c.id, name: c.name, skills: parseSkills(c.skills), years: c.years, edu: c.edu, city: c.city, exp_salary: c.exp_salary, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id }
+    return { candidate_id: c.id, name: c.name, skills: parseSkills(c.skills), years: c.years, edu: c.edu, city: c.city, exp_salary: c.exp_salary, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id, is_canary: m.is_canary, strategy_mode: m.strategy_mode }
   })
   rows.sort((a, b) => b.score - a.score)
   const strategy = getStrategy(posId)
-  res.json({ position: { ...pos, skills: parseSkills(pos.skills) }, candidates: rows, strategy })
+  const canaryVersion = getCanaryVersion(posId)
+  res.json({
+    position: { ...pos, skills: parseSkills(pos.skills) },
+    candidates: rows,
+    strategy,
+    canary: canaryVersion ? versionToStrategy(canaryVersion, posId, { isCanary: false }) : null,
+    canary_count: rows.filter(r => r.is_canary).length
+  })
 })
 
 app.get('/api/match/cand/:cid', (req, res) => {
@@ -612,7 +1055,7 @@ app.get('/api/match/cand/:cid', (req, res) => {
   const rows = poss.map(p => {
     // 与按职位推荐共用同一实时计算逻辑；显式重算的结果才写入最新结果/批次明细
     const m = computePair(candId, p.id)
-    return { position_id: p.id, name: p.name, dept: p.dept, city: p.city, level: p.level, salary_min: p.salary_min, salary_max: p.salary_max, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id, strategy_is_default: m.strategy_is_default }
+    return { position_id: p.id, name: p.name, dept: p.dept, city: p.city, level: p.level, salary_min: p.salary_min, salary_max: p.salary_max, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id, strategy_is_default: m.strategy_is_default, is_canary: m.is_canary, strategy_mode: m.strategy_mode }
   })
   rows.sort((a, b) => b.score - a.score)
   res.json({ candidate: { name: cand.name, skills: parseSkills(cand.skills), years: cand.years }, positions: rows })
@@ -631,7 +1074,11 @@ function resultFromStored(row) {
     reason: row.reason,
     weakness: row.weakness,
     computed_at: row.computed_at,
-    strategy_id: num(row.strategy_id)
+    strategy_id: num(row.strategy_id),
+    weights: parseJSON(row.weights, {}),
+    keyword_cap: num(row.keyword_cap, DEFAULT_KEYWORD_CAP),
+    is_canary: !!row.is_canary,
+    strategy_mode: row.strategy_mode || (num(row.strategy_id) ? 'full' : 'default')
   }
 }
 
@@ -662,7 +1109,7 @@ function insertStageEvent({ applicationId, stage, fromStage, eventType = 'advanc
     event_at: stamp,
     recalc_job_id: recalcJobId,
     backfilled
-  })
+  }, source || undefined)
   if (backfilled) {
     db.prepare(`INSERT INTO application_events(application_id,stage,from_stage,event_type,event_at,operator,score_snapshot,match_score,strategy_id,recalc_job_id,backfilled)
                 VALUES(?,?,?,?,?,?,?,?,?,?,1)
@@ -1106,9 +1553,30 @@ app.post('/api/offers/:id', (req, res, next) => {
 // 审批通过后的执行回写：按任务类型调用与直接操作完全相同的业务函数，
 // 保证「审批生效」与「直接操作」走同一条状态机路径，阶段/面试/Offer 三处口径一致
 function executeApprovalTask(task, actor) {
+  const payload = parseJSON(task.payload, {})
+  if (task.type === 'strategy_publish') {
+    const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(num(payload.strategy_version_id))
+    if (!v) badRequest('关联策略版本不存在', 'strategy_version_missing')
+    if (v.status !== 'pending') conflict(`策略版本当前状态为「${v.status}」，不能重复执行`, 'strategy_not_pending')
+    const at = new Date().toISOString()
+    const scheduled = v.effective_start && at < v.effective_start
+    if (scheduled) {
+      db.prepare("UPDATE strategy_versions SET status='scheduled', approved_at=? WHERE id=?").run(ts(), v.id)
+      return { desc: `策略 v${v.id} 已审批通过，将于 ${fmtWindow(v.effective_start)} 生效`, version: 1, deferred: true }
+    }
+    if (v.rollout_mode === 'canary') {
+      const r = activateCanaryVersion(v, { triggeredBy: actor.name })
+      return {
+        desc: `策略 v${v.id} 已灰度生效：${r.canary}/${r.pairs} 名候选人命中，观察窗口至 ${fmtWindow(v.effective_end) || '长期'}`,
+        version: 1, jobId: r.jobId
+      }
+    }
+    const r = activateFullVersion(v, { triggeredBy: actor.name, triggerType: 'strategy_publish' })
+    return { desc: `策略 v${v.id} 已全量生效，批次 #${r.jobId} 重算 ${r.pairs} 组匹配`, version: 1, jobId: r.jobId }
+  }
+
   const a = db.prepare('SELECT * FROM applications WHERE id=?').get(task.application_id)
   if (!a) badRequest('关联应聘记录不存在', 'app_missing')
-  const payload = parseJSON(task.payload, {})
   if (task.type === 'stage_advance') {
     const r = advanceApplication(a, { operator: actor.name, targetStage: payload.target_stage })
     return { desc: `已推进至「${STAGE_LABEL[r.stage]}」阶段`, version: r.version }
@@ -1135,6 +1603,7 @@ app.post('/api/approvals', (req, res, next) => {
   try {
     const out = tx(() => {
       if (!meta) badRequest('未知审批类型', 'unknown_task_type')
+      if (type === 'strategy_publish') badRequest('策略发布请使用 /api/positions/:id/strategy 专用入口', 'use_strategy_endpoint')
       if (user.role !== meta.submitRole) {
         forbidden(`「${meta.label}」申请需由${ROLE_LABEL[meta.submitRole]}发起，当前身份为「${ROLE_LABEL[user.role]}」`, 'role_not_allowed')
       }
@@ -1222,15 +1691,20 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       }
       const meta = TASK_TYPES[t.type]
       const note = String(b.note || '')
-      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
+      const payloadNow = parseJSON(t.payload, {})
+      const a = t.type === 'strategy_publish' ? null : db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
       const cand = a && db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
-      const pos = a && db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
-      const who = `${cand?.name || ''} · ${pos?.name || ''}`
+      const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a ? a.position_id : num(payloadNow.position_id))
+      const who = a ? `${cand?.name || ''} · ${pos?.name || ''}` : (pos ? `${pos.name} 策略` : `策略 #${t.id}`)
 
       if (b.action === 'return') {
         if (!note.trim()) badRequest('退回必须填写退回意见', 'note_required')
         db.prepare("UPDATE approval_tasks SET status='returned', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
           .run(ts(), note, taskId)
+        if (t.type === 'strategy_publish') {
+          db.prepare("UPDATE strategy_versions SET status='returned' WHERE id=? AND status='pending'")
+            .run(num(payloadNow.strategy_version_id))
+        }
         addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'return', actor: user, note })
         notify({
           recipientRole: t.submitted_role, type: 'task_returned',
@@ -1273,6 +1747,10 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
       if (execErr) {
         db.prepare("UPDATE approval_tasks SET status='failed', decided_at=?, decide_note=?, result_note=?, version=version+1 WHERE id=?")
           .run(stamp, note, execErr.message, taskId)
+        if (t.type === 'strategy_publish') {
+          db.prepare("UPDATE strategy_versions SET status='failed' WHERE id=? AND status='pending'")
+            .run(num(payloadNow.strategy_version_id))
+        }
         addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'failed', actor: user, note: `审批通过但执行失败：${execErr.message}` })
         // 危机事件关联的应聘：审批回写失败也是关键处置事件，上链留痕
         auditPassive({
@@ -1322,12 +1800,41 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
       if (!t) return { notFound: true }
       if (t.status !== 'returned') conflict('仅被退回的任务可以修改后重新提交', 'task_not_returned')
       if (t.submitted_by !== user.id) forbidden('仅原申请人可以重新提交该任务', 'not_submitter')
-      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
-      if (!a) return { notFound: true }
+      const a = t.type === 'strategy_publish' ? null : db.prepare('SELECT * FROM applications WHERE id=?').get(t.application_id)
+      if (!a && t.type !== 'strategy_publish') return { notFound: true }
       const meta = TASK_TYPES[t.type]
       const payload = { ...parseJSON(t.payload, {}) }
       let summary = ''
-      if (t.type === 'offer_issue') {
+      if (t.type === 'strategy_publish') {
+        const next = parseStrategyPayload({
+          weights: b.payload?.weights ?? payload.weights,
+          keyword_cap: b.payload?.keyword_cap ?? payload.keyword_cap,
+          rollout_mode: b.payload?.rollout_mode ?? payload.rollout_mode,
+          canary_percent: b.payload?.canary_percent ?? payload.canary_percent,
+          canary_candidate_ids: b.payload?.canary_candidate_ids ?? payload.canary_candidate_ids,
+          effective_start: b.payload?.effective_start ?? payload.effective_start,
+          effective_end: b.payload?.effective_end ?? payload.effective_end,
+          change_note: b.payload?.change_note ?? payload.change_note,
+          reset: b.payload?.reset,
+          allow_indefinite: true
+        })
+        Object.assign(payload, next)
+        const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(num(payload.strategy_version_id))
+        if (!v || v.position_id !== num(payload.position_id)) return { notFound: true }
+        const otherPending = db.prepare("SELECT id,status FROM strategy_versions WHERE position_id=? AND status IN ('pending','returned','scheduled') AND id<>? ORDER BY id DESC LIMIT 1")
+          .get(v.position_id, v.id)
+        if (otherPending) conflict(`该职位已有${otherPending.status === 'returned' ? '退回' : otherPending.status === 'scheduled' ? '待生效' : '待审批'}策略 v${otherPending.id}，请先处理后再重提`, 'strategy_pending_exists')
+        const activeCanary = db.prepare("SELECT id FROM strategy_versions WHERE position_id=? AND status='canary' AND id<>?")
+          .get(v.position_id, v.id)
+        if (activeCanary) conflict(`该职位存在灰度策略 v${activeCanary.id}，请先全量或回滚`, 'strategy_canary_exists')
+        db.prepare(`UPDATE strategy_versions
+                    SET weights=?,keyword_cap=?,rollout_mode=?,canary_percent=?,canary_candidate_ids=?,
+                        effective_start=?,effective_end=?,change_note=?,status='pending'
+                    WHERE id=?`)
+          .run(JSON.stringify(next.weights), next.keywordCap, next.rolloutMode, next.canaryPercent,
+            JSON.stringify(next.canaryIds), next.effectiveStart, next.effectiveEnd, next.changeNote, v.id)
+        summary = `策略改为${next.rolloutMode === 'canary' ? `灰度 ${next.canaryIds.length || next.canaryPercent + '%'}` : '全量'}发布`
+      } else if (t.type === 'offer_issue') {
         const salary = num(b.payload?.salary, num(payload.salary))
         if (salary < SALARY_MIN || salary > SALARY_MAX) badRequest(`Offer 月薪需在 ${SALARY_MIN}~${SALARY_MAX} 之间`, 'salary_range')
         payload.salary = salary
@@ -1353,13 +1860,14 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
       db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decide_note='', version=version+1 WHERE id=?")
         .run(JSON.stringify(payload), JSON.stringify(chain), ts(), taskId)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'resubmit', actor: user, note: summary })
-      const cand = db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
-      const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
+      const cand = a && db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
+      const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a ? a.position_id : num(payload.position_id))
+      const targetName = a ? `${cand?.name || ''} · ${pos?.name || ''}` : `${pos?.name || ''} 策略 v${payload.strategy_version_id}`
       notify({
         recipientRole: chain[0].role, type: 'task_resubmitted',
         title: `${meta.label}申请已修改重提`,
-        body: `${user.name} 重新提交「${cand?.name || ''} · ${pos?.name || ''}」：${summary}`,
-        taskId, appId: a.id
+        body: `${user.name} 重新提交「${targetName}」：${summary}`,
+        taskId, appId: a ? a.id : 0
       })
       return { ok: true, status: 'pending', chain }
     })
@@ -1379,14 +1887,20 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
       if (t.status !== 'pending' && t.status !== 'returned') conflict('该任务已结案，无法撤销', 'task_closed')
       if (t.submitted_by !== user.id) forbidden('仅原申请人可以撤销该任务', 'not_submitter')
       db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, version=version+1 WHERE id=?").run(ts(), taskId)
+      if (t.type === 'strategy_publish') {
+        const payload = parseJSON(t.payload, {})
+        db.prepare("UPDATE strategy_versions SET status='cancelled' WHERE id=? AND status IN ('pending','returned')")
+          .run(num(payload.strategy_version_id))
+      }
       addStep(taskId, { stepNo: -1, role: user.role, action: 'cancel', actor: user, note: String(req.body?.note || '') })
       if (t.status === 'pending') {
         const chain = parseJSON(t.chain, [])
         const meta = TASK_TYPES[t.type]
+        const payload = parseJSON(t.payload, {})
         notify({
           recipientRole: chain[t.current_step]?.role || '', type: 'task_cancelled',
           title: `${meta?.label || '审批'}申请已撤销`,
-          body: `${user.name} 撤销了「${meta?.label || ''}」申请 #${taskId}`,
+          body: `${user.name} 撤销了「${meta?.label || ''}」申请 #${taskId}${payload.strategy_version_id ? `（v${payload.strategy_version_id}）` : ''}`,
           taskId, appId: t.application_id
         })
       }
@@ -1440,7 +1954,7 @@ function migrateHistory() {
     if (pairRows.length && !hadStartupJob) {
       jobId = createRecalcJob({ triggerType: 'startup', scope: 'startup', triggeredBy: 'system-migration' })
       pairRows.forEach(r => upsertMatch(r.candidate_id, r.position_id, jobId))
-      completeRecalcJob(jobId, pairRows.length)
+      completeRecalcJob(jobId, pairRows.length, 0, pairRows.length)
     } else {
       jobId = latestStartupJob
     }
@@ -1506,6 +2020,12 @@ function migrateHistory() {
   })
 }
 migrateHistory()
+try {
+  const due = sweepStrategyWindows()
+  if (due.length) console.log(`[HR] strategy window swept ${due.length} version(s)`)
+} catch (e) {
+  console.error('[HR] strategy window sweep failed:', e)
+}
 
 // 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
 bindCrisisCore({ rollbackForIncident })

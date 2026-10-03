@@ -251,7 +251,7 @@ function weightText(weights = {}) {
                 <div class="ms-labels">
                   <em :class="{ on: scoreView === 'snapshot' }">投递 {{ versionTag(histEvidence(a)?.strategy_id) }}</em>
                   <em :class="{ on: scoreView === 'event' }">{{ stageLabel[a.stage] }} {{ versionTag(eventEvidence(a)?.strategy_id) }}</em>
-                  <em :class="{ on: scoreView === 'latest' }">最新 {{ versionTag(latestEvidence(a)?.strategy_id) }}</em>
+                  <em :class="{ on: scoreView === 'latest' }">最新 {{ versionTag(latestEvidence(a)?.strategy_id) }}<i v-if="latestEvidence(a)?.is_canary">🧪</i></em>
                 </div>
                 <div class="mweak" v-if="activeEvidence(a).weakness && activeEvidence(a).weakness !== '无显著短板'">短板：{{ activeEvidence(a).weakness }}</div>
                 <div class="mreason muted">{{ activeEvidence(a).reason || '暂无评分说明' }}</div>
@@ -363,12 +363,14 @@ function weightText(weights = {}) {
         <div class="trace-latest" v-if="traceApp.match">
           <div>
             <b>🆕 最新重算结果 <span class="score-pill" :class="scoreClass(traceApp.match.score)">{{ traceApp.match.score }}</span></b>
-            <div class="muted">{{ evidenceTime(traceApp.match) }} · {{ versionTag(traceApp.match.strategy_id) }}</div>
+            <div class="muted">{{ evidenceTime(traceApp.match) }} · {{ versionTag(traceApp.match.strategy_id) }}
+              <span class="canary-pill" v-if="traceApp.match.is_canary">🧪 灰度命中</span>
+            </div>
           </div>
           <div class="muted">
             批次 #{{ traceApp.match.recalc_job_id || '—' }}
             <template v-if="jobInfo(traceApp.match.recalc_job_id)">
-              · {{ { strategy_publish: '策略发布', manual: '手动重算', startup: '启动迁移' }[jobInfo(traceApp.match.recalc_job_id).trigger_type] || jobInfo(traceApp.match.recalc_job_id).trigger_type }}
+              · {{ { strategy_publish: '全量发布', strategy_canary: '灰度发布', strategy_promote: '灰度转正', strategy_rollback: '策略回滚', manual: '手动重算', startup: '启动迁移' }[jobInfo(traceApp.match.recalc_job_id).trigger_type] || jobInfo(traceApp.match.recalc_job_id).trigger_type }}
             </template>
           </div>
         </div>
@@ -380,7 +382,7 @@ function weightText(weights = {}) {
               <div class="te-head">
                 <b>{{ stageLabel[e.stage] || e.stage }}</b>
                 <span class="etype" :class="e.event_type">{{ eventLabel[e.event_type] || e.event_type }}</span>
-                <span class="ver-tag">{{ versionTag(e.snapshot?.strategy_id) }}</span>
+                <span class="ver-tag">{{ versionTag(e.snapshot?.strategy_id) }}<i v-if="e.snapshot?.is_canary"> 🧪</i></span>
                 <span class="job-tag" v-if="e.snapshot?.recalc_job_id">批次 #{{ e.snapshot.recalc_job_id }}</span>
                 <span class="backfill-tag" v-if="e.backfilled">补录</span>
                 <em class="muted">{{ fmtTime(e.event_at) }} · {{ e.operator }}</em>
@@ -524,6 +526,7 @@ function weightText(weights = {}) {
 .te-head em { margin-left: auto; font-style: normal; font-size: 11px; }
 .ver-tag, .job-tag, .backfill-tag { border-radius: 10px; padding: 2px 7px; font-size: 10px; border: 1px solid var(--border); color: var(--muted); }
 .ver-tag { color: var(--purple); border-color: rgba(167,139,250,.35); background: rgba(167,139,250,.1); }
+.canary-pill { font-size: 10px; color: var(--purple); border: 1px solid rgba(167,139,250,.45); border-radius: 9px; padding: 1px 6px; margin-left: 6px; }
 .backfill-tag { color: var(--accent2); border-color: rgba(255,209,102,.35); background: rgba(255,209,102,.1); }
 .te-grid { display: grid; grid-template-columns: 54px 1fr; gap: 10px; align-items: start; }
 .te-score { width: 48px; height: 48px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 900; }
