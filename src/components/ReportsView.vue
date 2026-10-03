@@ -112,6 +112,37 @@ const avgSalary = computed(() => {
   const offers = store.offers.filter(o => o.status === 'accepted' || o.status === 'joined')
   return offers.length ? Math.round(offers.reduce((s, o) => s + o.salary, 0) / offers.length) : 0
 })
+
+const strategyStatusName = {
+  pending_approval: '待审批', scheduled: '待生效', canary: '灰度中', active: '生效中',
+  canary_ended: '灰度结束', retired: '已退役', cancelled: '已取消', returned: '已退回', rolled_back: '已回滚'
+}
+const strategyGovernance = computed(() => {
+  const versions = store.strategyVersions
+  const events = store.strategyEvents
+  const jobs = store.recalcJobs.filter(j => String(j.trigger_type || '').startsWith('strategy_'))
+  const byStatus = {}
+  versions.forEach(v => { byStatus[v.status] = (byStatus[v.status] || 0) + 1 })
+  const canaryApps = store.applications.filter(a => a.strategy_mode === 'canary')
+  const canarySnapshots = store.applications.flatMap(a => a.events || [])
+    .filter(e => e.strategy_mode === 'canary')
+  const avgCanary = canaryApps.length ? Math.round(canaryApps.reduce((s, a) => s + (a.stageSnapshot?.score ?? a.matchSnapshot?.score ?? 0), 0) / canaryApps.length) : 0
+  const avgStable = store.applications.length ? Math.round(store.applications.reduce((s, a) => s + (a.matchSnapshot?.score ?? 0), 0) / store.applications.length) : 0
+  return {
+    total: versions.length,
+    pending: byStatus.pending_approval || 0,
+    scheduled: byStatus.scheduled || 0,
+    canary: byStatus.canary || 0,
+    rollbacks: versions.filter(v => v.rollback_of_version_id || v.status === 'rolled_back').length,
+    canaryApps: canaryApps.length,
+    canarySnapshots: canarySnapshots.length,
+    avgCanary,
+    avgStable,
+    jobs: jobs.length,
+    recalcPairs: jobs.reduce((s, j) => s + Number(j.pair_count || 0), 0),
+    events: events.length
+  }
+})
 </script>
 
 <template>
@@ -122,6 +153,25 @@ const avgSalary = computed(() => {
       <div class="card stat"><span>🎉</span><b class="money">{{ joinedCount }}</b><em>已入职人数</em></div>
       <div class="card stat"><span>✅</span><b class="money">{{ offerAcceptedCount }}</b><em>已接受 Offer</em></div>
       <div class="card stat"><span>⏳</span><b>{{ pendingOfferCount }}</b><em>待回应 Offer</em></div>
+    </div>
+
+    <div class="card governance-card">
+      <h3>⚙️ 策略版本治理与灰度统计</h3>
+      <div class="gov-grid">
+        <div><b>{{ strategyGovernance.total }}</b><em>版本总数</em></div>
+        <div><b>{{ strategyGovernance.pending }}</b><em>待审批</em></div>
+        <div><b>{{ strategyGovernance.scheduled }}</b><em>待生效</em></div>
+        <div><b>{{ strategyGovernance.canary }}</b><em>灰度职位</em></div>
+        <div><b>{{ strategyGovernance.canaryApps }}</b><em>灰度快照应聘</em></div>
+        <div><b>{{ strategyGovernance.rollbacks }}</b><em>回滚版本</em></div>
+        <div><b>{{ strategyGovernance.jobs }}</b><em>策略批次</em></div>
+        <div><b>{{ strategyGovernance.recalcPairs }}</b><em>联动重算对数</em></div>
+      </div>
+      <div class="gov-cmp muted">
+        稳定快照平均分 <b>{{ strategyGovernance.avgStable }}</b> ·
+        灰度命中快照平均分 <b>{{ strategyGovernance.canaryApps ? strategyGovernance.avgCanary : '--' }}</b> ·
+        版本事件 <b>{{ strategyGovernance.events }}</b> 条；报表仅统计不可变投递/阶段快照，不用实时预览分污染决策口径。
+      </div>
     </div>
 
     <div class="row">
@@ -226,6 +276,13 @@ const avgSalary = computed(() => {
 .stat span { font-size: 24px; }
 .stat b { font-size: 24px; }
 .stat em { font-style: normal; color: var(--muted); font-size: 13px; }
+.governance-card h3 { margin-bottom: 12px; }
+.gov-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.gov-grid div { background: var(--panel2); border-radius: 10px; padding: 12px; text-align: center; }
+.gov-grid b { font-size: 22px; color: var(--accent); display: block; }
+.gov-grid em { font-style: normal; font-size: 12px; color: var(--muted); }
+.gov-cmp { margin-top: 10px; font-size: 12px; line-height: 1.7; }
+.gov-cmp b { color: var(--accent2); }
 .row { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 16px; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 1000px) { .row, .row2 { grid-template-columns: 1fr; } }

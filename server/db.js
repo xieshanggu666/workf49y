@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS matches (
   reason TEXT NOT NULL DEFAULT '',
   weakness TEXT NOT NULL DEFAULT '',
   computed_at TEXT NOT NULL DEFAULT '',  -- 最近一次按策略重算的时间（最新结果）
-  strategy_id INTEGER NOT NULL DEFAULT 0 -- 重算时使用的策略版本（0=系统默认/历史数据）
+  strategy_id INTEGER NOT NULL DEFAULT 0, -- 重算时使用的策略版本（0=系统默认/历史数据）
+  strategy_mode TEXT NOT NULL DEFAULT 'stable', -- latest 评分来自稳定还是灰度版本
+  canary_percent INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS applications (
@@ -61,6 +63,9 @@ CREATE TABLE IF NOT EXISTS applications (
   stage_snapshot TEXT NOT NULL DEFAULT '', -- 进入「当前阶段」时的评分快照（随阶段进入/回退/复活更新）
   entered_at TEXT NOT NULL DEFAULT '',     -- 进入当前阶段的时间
   reject_from TEXT NOT NULL DEFAULT '',    -- 淘汰前所在阶段（供异常回退/复活定位来源）
+  strategy_mode TEXT NOT NULL DEFAULT 'stable', -- 投递/阶段快照当时命中的策略通道 stable/canary/default
+  strategy_version_id INTEGER NOT NULL DEFAULT 0, -- 快照策略版本（冗余，便于报表/审批直接统计）
+  canary_percent INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL DEFAULT 1       -- 乐观锁版本：每次阶段协同 +1，防重复/并发操作
 );
 
@@ -70,27 +75,67 @@ CREATE TABLE IF NOT EXISTS match_strategies (
   weights TEXT NOT NULL DEFAULT '{}', -- {skill,year,salary,edu,city} 归一化后合计为1
   keyword_cap INTEGER NOT NULL DEFAULT 5, -- 简历关键词加分上限（0=关闭）
   published_at TEXT NOT NULL DEFAULT '',
-  published_by TEXT NOT NULL DEFAULT ''
+  published_by TEXT NOT NULL DEFAULT '',
+  current_version_id INTEGER NOT NULL DEFAULT 0, -- 当前稳定生效版本（0=系统默认/历史策略）
+  canary_version_id INTEGER NOT NULL DEFAULT 0,  -- 灰度中的版本（0=无灰度）
+  stable_version_id INTEGER NOT NULL DEFAULT 0,  -- 灰度期间保持不变的稳定基线
+  updated_at TEXT NOT NULL DEFAULT ''
 );
 
--- 策略发布留痕，支持追溯每次重算所依据的版本
+-- 策略版本治理：一次发布生成不可变版本；审批、定时生效、灰度、转正、回滚/过期均围绕版本状态机流转
 CREATE TABLE IF NOT EXISTS strategy_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   position_id INTEGER NOT NULL,
   weights TEXT NOT NULL DEFAULT '{}',
   keyword_cap INTEGER NOT NULL DEFAULT 5,
   published_at TEXT NOT NULL DEFAULT '',
-  published_by TEXT NOT NULL DEFAULT ''
+  published_by TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active', -- pending_approval/scheduled/canary/canary_ended/active/retired/cancelled/rolled_back
+  active_at TEXT NOT NULL DEFAULT '',          -- 生效窗口起点
+  canary_end_at TEXT NOT NULL DEFAULT '',      -- 灰度观察截止；到期自动结束灰度但不自动转正
+  expire_at TEXT NOT NULL DEFAULT '',          -- 稳定版本失效时间；空表示长期有效
+  canary_percent INTEGER NOT NULL DEFAULT 0,   -- 0=稳定发布；1-99=灰度；100=全量灰度
+  is_stable INTEGER NOT NULL DEFAULT 1,
+  is_canary INTEGER NOT NULL DEFAULT 0,
+  base_version_id INTEGER NOT NULL DEFAULT 0,  -- 灰度基线/回滚来源版本（0=系统默认）
+  rollback_of_version_id INTEGER NOT NULL DEFAULT 0,
+  approval_task_id INTEGER NOT NULL DEFAULT 0,
+  recalc_on_activate INTEGER NOT NULL DEFAULT 1,
+  change_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_strategy_versions_pos ON strategy_versions(position_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_versions_pos ON strategy_versions(position_id, id);
+CREATE INDEX IF NOT EXISTS idx_strategy_versions_status ON strategy_versions(status, active_at);
+
+-- 策略版本事件：提交/审批联动/定时生效/灰度/转正/回滚/过期/取消只追加，形成版本治理审计时间线
+CREATE TABLE IF NOT EXISTS strategy_version_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id INTEGER NOT NULL,
+  position_id INTEGER NOT NULL,
+  action TEXT NOT NULL, -- submit/approve/activate/canary_start/canary_end/promote/rollback/expire/cancel/scheduled
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',
+  approval_task_id INTEGER NOT NULL DEFAULT 0,
+  recalc_job_id INTEGER NOT NULL DEFAULT 0,
+  event_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_events_version ON strategy_version_events(version_id, id);
+CREATE INDEX IF NOT EXISTS idx_strategy_events_pos ON strategy_version_events(position_id, id);
 
 -- 重算批次：把策略发布/手动重算/启动迁移与每一次批量评分关联起来
 CREATE TABLE IF NOT EXISTS recalc_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  trigger_type TEXT NOT NULL, -- strategy_publish/manual/startup
-  scope TEXT NOT NULL,        -- position/global/startup
+  trigger_type TEXT NOT NULL, -- strategy_publish/manual/startup/strategy_activate/strategy_promote/strategy_rollback
+  scope TEXT NOT NULL,        -- position/global/startup/canary/stable
   position_id INTEGER NOT NULL DEFAULT 0,
   strategy_id INTEGER NOT NULL DEFAULT 0,
+  base_strategy_id INTEGER NOT NULL DEFAULT 0,
+  strategy_mode TEXT NOT NULL DEFAULT 'stable',
+  canary_percent INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'completed',
   pair_count INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL DEFAULT '',
@@ -106,6 +151,9 @@ CREATE TABLE IF NOT EXISTS recalc_items (
   candidate_id INTEGER NOT NULL,
   position_id INTEGER NOT NULL,
   strategy_id INTEGER NOT NULL DEFAULT 0,
+  strategy_mode TEXT NOT NULL DEFAULT 'stable',
+  canary_percent INTEGER NOT NULL DEFAULT 0,
+  in_canary INTEGER NOT NULL DEFAULT 0,
   score INTEGER NOT NULL DEFAULT 0,
   dims TEXT NOT NULL DEFAULT '[]',
   reason TEXT NOT NULL DEFAULT '',
@@ -129,6 +177,8 @@ CREATE TABLE IF NOT EXISTS application_events (
   score_snapshot TEXT NOT NULL DEFAULT '',
   match_score INTEGER NOT NULL DEFAULT 0,
   strategy_id INTEGER NOT NULL DEFAULT 0,
+  strategy_mode TEXT NOT NULL DEFAULT 'stable',
+  canary_percent INTEGER NOT NULL DEFAULT 0,
   recalc_job_id INTEGER NOT NULL DEFAULT 0,
   backfilled INTEGER NOT NULL DEFAULT 0
 );
@@ -195,8 +245,10 @@ CREATE TABLE IF NOT EXISTS users (
 -- 审批链在提交时固化为 JSON（含动态加签节点），任务推进只移动 current_step 指针
 CREATE TABLE IF NOT EXISTS approval_tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT NOT NULL,                 -- stage_advance/interview_conclusion/offer_issue
+  type TEXT NOT NULL,                 -- stage_advance/interview_conclusion/offer_issue/strategy_publish
   application_id INTEGER NOT NULL,
+  position_id INTEGER NOT NULL DEFAULT 0,
+  strategy_version_id INTEGER NOT NULL DEFAULT 0,
   interview_id INTEGER NOT NULL DEFAULT 0,
   offer_id INTEGER NOT NULL DEFAULT 0,
   payload TEXT NOT NULL DEFAULT '{}', -- 申请内容快照（目标阶段/结论/薪资等，重提时整体替换）
@@ -458,6 +510,81 @@ addColumn('interviews', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
+
+// 策略版本治理（旧库升级）：补齐版本窗口、灰度、审批和通道统计字段
+addColumn('match_strategies', 'current_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('match_strategies', 'canary_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('match_strategies', 'stable_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('match_strategies', 'updated_at', `TEXT NOT NULL DEFAULT ''`)
+;[
+  ['status', `TEXT NOT NULL DEFAULT 'active'`],
+  ['active_at', `TEXT NOT NULL DEFAULT ''`],
+  ['canary_end_at', `TEXT NOT NULL DEFAULT ''`],
+  ['expire_at', `TEXT NOT NULL DEFAULT ''`],
+  ['canary_percent', `INTEGER NOT NULL DEFAULT 0`],
+  ['is_stable', `INTEGER NOT NULL DEFAULT 1`],
+  ['is_canary', `INTEGER NOT NULL DEFAULT 0`],
+  ['base_version_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['rollback_of_version_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['approval_task_id', `INTEGER NOT NULL DEFAULT 0`],
+  ['recalc_on_activate', `INTEGER NOT NULL DEFAULT 1`],
+  ['change_note', `TEXT NOT NULL DEFAULT ''`],
+  ['created_at', `TEXT NOT NULL DEFAULT ''`],
+  ['updated_at', `TEXT NOT NULL DEFAULT ''`]
+].forEach(([col, ddl]) => addColumn('strategy_versions', col, ddl))
+addColumn('matches', 'strategy_mode', `TEXT NOT NULL DEFAULT 'stable'`)
+addColumn('matches', 'canary_percent', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('applications', 'strategy_mode', `TEXT NOT NULL DEFAULT 'stable'`)
+addColumn('applications', 'strategy_version_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('applications', 'canary_percent', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_jobs', 'base_strategy_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_jobs', 'strategy_mode', `TEXT NOT NULL DEFAULT 'stable'`)
+addColumn('recalc_jobs', 'canary_percent', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_items', 'strategy_mode', `TEXT NOT NULL DEFAULT 'stable'`)
+addColumn('recalc_items', 'canary_percent', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('recalc_items', 'in_canary', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('application_events', 'strategy_mode', `TEXT NOT NULL DEFAULT 'stable'`)
+addColumn('application_events', 'canary_percent', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('approval_tasks', 'position_id', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('approval_tasks', 'strategy_version_id', `INTEGER NOT NULL DEFAULT 0`)
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS strategy_version_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id INTEGER NOT NULL,
+  position_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',
+  approval_task_id INTEGER NOT NULL DEFAULT 0,
+  recalc_job_id INTEGER NOT NULL DEFAULT 0,
+  event_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_events_version ON strategy_version_events(version_id, id);
+CREATE INDEX IF NOT EXISTS idx_strategy_events_pos ON strategy_version_events(position_id, id);
+`)
+
+// 历史策略版本视作已经全量稳定生效；旧 match_strategies 指针补到该职位最新版本
+db.prepare(`UPDATE strategy_versions
+            SET status='active', is_stable=1, is_canary=0, canary_percent=0,
+                active_at=COALESCE(NULLIF(active_at,''), published_at),
+                created_at=COALESCE(NULLIF(created_at,''), published_at),
+                updated_at=COALESCE(NULLIF(updated_at,''), published_at)
+            WHERE status='' OR status IS NULL`).run()
+db.prepare(`UPDATE match_strategies
+            SET current_version_id=(SELECT MAX(id) FROM strategy_versions sv WHERE sv.position_id=match_strategies.position_id),
+                stable_version_id=(SELECT MAX(id) FROM strategy_versions sv WHERE sv.position_id=match_strategies.position_id),
+                updated_at=COALESCE(NULLIF(updated_at,''), published_at)
+            WHERE current_version_id=0
+              AND EXISTS (SELECT 1 FROM strategy_versions sv WHERE sv.position_id=match_strategies.position_id)`).run()
+db.exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_one_canary ON strategy_versions(position_id) WHERE status='canary';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_one_pending ON strategy_versions(position_id) WHERE status='pending_approval';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_one_scheduled ON strategy_versions(position_id) WHERE status='scheduled';
+`)
 
 // 危机回退同步：进行中的预约被危机处置挂起（status 复用 cancelled，crisis_suspended=1 标记），
 // 之后可在原单上「重新协商」恢复后续流程；incident_id 保留来源事件用于追溯

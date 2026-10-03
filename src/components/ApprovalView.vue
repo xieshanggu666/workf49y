@@ -16,14 +16,16 @@ const STAGE_LABEL = { submitted: '投递', screening: '筛选', interview: '面�
 const TYPE_META = {
   stage_advance: { icon: '🔄', label: '候选人推进', submitRole: 'recruiter' },
   interview_conclusion: { icon: '💬', label: '面试结论', submitRole: 'interviewer' },
-  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' }
+  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' },
+  strategy_publish: { icon: '⚙️', label: '匹配策略发布', submitRole: 'recruiter' }
 }
 const STATUS_META = {
   pending: ['⏳', '审批中', 'var(--accent2)'],
   approved: ['✅', '已通过·已生效', 'var(--green)'],
   returned: ['↩️', '已退回', 'var(--red)'],
   cancelled: ['🚫', '已撤销', 'var(--muted)'],
-  failed: ['⚠️', '执行失败', 'var(--red)']
+  failed: ['⚠️', '执行失败', 'var(--red)'],
+  expired: ['⌛', '已失效', 'var(--muted)']
 }
 const STEP_ACTION = {
   submit: ['📨', '提交申请'], approve: ['✅', '审批通过'], return: ['↩️', '退回'],
@@ -50,6 +52,11 @@ function payloadSummary(t) {
   if (t.type === 'stage_advance') return `推进「${STAGE_LABEL[p.from_stage] || p.from_stage} → ${STAGE_LABEL[p.target_stage] || p.target_stage}」`
   if (t.type === 'interview_conclusion') return `「${p.round}」结论：${p.conclusion === 'pass' ? '✅ 通过' : '❌ 不通过'}`
   if (t.type === 'offer_issue') return `月薪 ¥${Number(p.salary || 0).toLocaleString()}${p.note ? ` · ${p.note}` : ''}`
+  if (t.type === 'strategy_publish') {
+    const mode = p.canary_percent > 0 && p.canary_percent < 100 ? `🧪 ${p.canary_percent}% 灰度` : '全量稳定发布'
+    const w = p.weights || {}
+    return `${mode} · 技${Math.round((w.skill || 0) * 100)}%/薪${Math.round((w.salary || 0) * 100)}% · ${p.active_at ? fmtTime(p.active_at) : '立即生效'}${p.change_note ? ` · ${p.change_note}` : ''}`
+  }
   return ''
 }
 // 审批链节点展示：提交 → 各级审批；当前等待节点高亮
@@ -104,9 +111,9 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
   <div class="approval">
     <!-- 角色权限说明：当前身份决定可发起的申请类型与可审批的节点 -->
     <div class="role-banner card">
-      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
+      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起 <b>Offer 发放</b>与<b>匹配策略发布</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
       <span v-else-if="myRole === 'interviewer'">💬 当前身份「面试官」：可提交<b>面试结论</b>申请（通过/不通过），由招聘负责人审批后生效。</span>
-      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>与<b>Offer 发放</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
+      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>、<b>Offer 发放</b>与<b>匹配策略发布</b>申请；可退回并附意见。</span>
     </div>
 
     <div class="stat-row">
@@ -140,8 +147,9 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
           <em class="muted">#{{ t.id }}</em>
         </div>
         <div class="t-main">
-          <b>{{ t.candidate }}</b>
-          <span class="muted">{{ t.position }} · {{ t.dept }}</span>
+          <b v-if="t.type !== 'strategy_publish'">{{ t.candidate }}</b>
+          <b v-else>⚙️ 策略版本 v{{ t.strategy_version_id }}</b>
+          <span class="muted">{{ t.position }}<template v-if="t.dept"> · {{ t.dept }}</template></span>
           <span class="t-summary">{{ payloadSummary(t) }}</span>
         </div>
         <!-- 审批链进度：提交 → 逐级审批，当前等待节点高亮 -->
@@ -168,7 +176,7 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
             <button class="warn" :disabled="busy(t.id)" @click="openReturn(t)">↩️ 退回</button>
           </template>
           <template v-if="canOperate(t)">
-            <button v-if="t.status === 'returned'" class="primary" :disabled="busy(t.id)" @click="openResubmit(t)">✏️ 修改重提</button>
+            <button v-if="t.status === 'returned' && t.type !== 'strategy_publish'" class="primary" :disabled="busy(t.id)" @click="openResubmit(t)">✏️ 修改重提</button>
             <button class="ghost" :disabled="busy(t.id)" @click="onCancel(t)">🚫 撤销</button>
           </template>
           <button class="ghost steps-toggle" @click="toggleSteps(t)">

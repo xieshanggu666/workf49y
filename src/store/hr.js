@@ -37,6 +37,7 @@ export const useHrStore = defineStore('hr', {
     channels: s => s.data?.channels || [],
     matches: s => s.data?.matches || [],
     strategyVersions: s => s.data?.strategyVersions || [],
+    strategyEvents: s => s.data?.strategyEvents || [],
     recalcJobs: s => s.data?.recalcJobs || [],
     recalcItems: s => s.data?.recalcItems || [],
     users: s => s.data?.users || [],
@@ -140,6 +141,26 @@ export const useHrStore = defineStore('hr', {
       try { return await j('GET', `/positions/${pid}/strategy`) } catch (e) { this.notify('error', e.message); return null }
     },
     publishStrategy(pid, payload) { return this.api('POST', `/positions/${pid}/strategy`, payload) },
+    promoteStrategy(id, note) {
+      return this.runBusy(`strategy-promote:${id}`, () =>
+        this.api('POST', `/strategy-versions/${id}/promote`, { note }, { success: '灰度版本已转正并全量重算' }))
+    },
+    endStrategyCanary(id, note) {
+      return this.runBusy(`strategy-canary-end:${id}`, () =>
+        this.api('POST', `/strategy-versions/${id}/end-canary`, { note }, { success: '灰度已结束，已恢复基线策略' }))
+    },
+    cancelStrategyVersion(id, note) {
+      return this.runBusy(`strategy-cancel:${id}`, () =>
+        this.api('POST', `/strategy-versions/${id}/cancel`, { note }, { success: '策略版本已取消' }))
+    },
+    rollbackStrategy(pid, payload) {
+      return this.runBusy(`strategy-rollback:${pid}:${Date.now()}`, () =>
+        this.api('POST', `/positions/${pid}/strategy/rollback`, payload, { success: '策略已回滚并触发批量重算' }))
+    },
+    sweepStrategies() {
+      return this.runBusy('strategy-sweep', () =>
+        this.api('POST', '/strategy/sweep', {}, { success: '生效窗口扫描已执行' }))
+    },
     recomputeAll(positionId) {
       return this.api('POST', '/match/recompute', positionId ? { position_id: positionId } : {})
     },

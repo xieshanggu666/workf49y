@@ -25,11 +25,29 @@ const DIM_META = [
 const strategyOpen = ref(false)
 const strategyPos = ref(null)
 const strategyForm = ref({ weights: {}, keyword_cap: 5 })
+const strategyVersionsData = ref([])
+const strategyAdvanced = ref({ active_at: '', canary_percent: 0, canary_end_at: '', expire_at: '', change_note: '', direct: false })
 const strategySaving = ref(false)
 const strategyMsg = ref('')
 const weightPct = k => Math.round((strategyForm.value.weights[k] || 0) * 100)
 const weightSumPct = computed(() => Object.values(strategyForm.value.weights).reduce((s, v) => s + (Number(v) || 0), 0))
 const lastVersionOf = pid => store.strategyVersions.find(v => v.position_id === pid) || null
+const strategyStatusMeta = {
+  pending_approval: ['⏳ 待审批', 'warn'], scheduled: ['🕒 待生效', 'warn'], canary: ['🧪 灰度中', 'canary'],
+  canary_ended: ['↩️ 灰度已结束', 'muted'], active: ['✅ 生效中', 'ok'], retired: ['📦 已退役', 'muted'],
+  cancelled: ['🚫 已取消', 'muted'], returned: ['↩️ 已退回', 'danger'], rolled_back: ['⛔ 已回滚', 'danger']
+}
+function fmtTime(t) { return t ? String(t).replace('T', ' ').slice(0, 16) : '' }
+function toLocalInput(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+const currentGovernance = computed(() => strategyPos.value ? store.positions.find(p => p.id === strategyPos.value.id)?.strategyGovernance : null)
+const canaryVersion = computed(() => currentGovernance.value?.canaryVersion || null)
+const stableVersion = computed(() => currentGovernance.value?.stableVersion || null)
 
 async function openStrategy(p) {
   strategyPos.value = p
@@ -37,26 +55,66 @@ async function openStrategy(p) {
   const r = await store.getStrategy(p.id)
   const st = r.strategy || {}
   strategyForm.value = { weights: { ...(st.weights || store.defaultStrategy.weights) }, keyword_cap: st.keywordCap ?? store.defaultStrategy.keywordCap }
+  strategyVersionsData.value = r.versions || []
+  strategyAdvanced.value = { active_at: '', canary_percent: 0, canary_end_at: '', expire_at: '', change_note: '', direct: false }
   strategyOpen.value = true
 }
 function setWeight(k, pct) { strategyForm.value.weights[k] = Math.round(Number(pct)) / 100 }
 async function submitStrategy(reset = false) {
   strategySaving.value = true
   strategyMsg.value = ''
-  const r = await store.publishStrategy(strategyPos.value.id, {
+  const payload = {
     reset,
     weights: strategyForm.value.weights,
     keyword_cap: Number(strategyForm.value.keyword_cap),
-    recalc: true,
-    published_by: 'HR'
-  })
+    published_by: 'HR',
+    change_note: strategyAdvanced.value.change_note,
+    canary_percent: reset ? 0 : Number(strategyAdvanced.value.canary_percent || 0),
+    active_at: !reset && strategyAdvanced.value.active_at ? new Date(strategyAdvanced.value.active_at).toISOString() : '',
+    canary_end_at: !reset && strategyAdvanced.value.canary_end_at ? new Date(strategyAdvanced.value.canary_end_at).toISOString() : '',
+    expire_at: !reset && strategyAdvanced.value.expire_at ? new Date(strategyAdvanced.value.expire_at).toISOString() : '',
+    // 默认纳入用人经理审批；勾选“紧急直发”才保留旧版立即发布行为
+    direct: strategyAdvanced.value.direct
+  }
+  if (payload.direct) payload.recalc = true
+  const r = await store.publishStrategy(strategyPos.value.id, payload)
   strategySaving.value = false
   if (r?.ok) {
-    strategyMsg.value = `策略 ${r.strategy?.versionId ? 'v' + r.strategy.versionId : 'v0'} 已发布，批次 #${r.job_id || '-'} 已重算 ${r.recalced} 个候选人`
-    setTimeout(() => { strategyOpen.value = false }, 900)
+    strategyMsg.value = r.approval_task_id
+      ? `策略 v${r.strategy?.versionId} 已提交审批（任务 #${r.approval_task_id}）`
+      : `策略 v${r.strategy?.versionId} 已发布，批次 #${r.job_id || '-'} 已重算 ${r.recalced} 个候选人`
+    setTimeout(() => { strategyOpen.value = false }, 1200)
   } else {
     strategyMsg.value = '发布失败，请重试'
   }
+}
+
+async function promoteCanary() {
+  if (!canaryVersion.value) return
+  const note = prompt('确认将灰度版本转正为全量稳定策略？请填写观察结论', '灰度指标正常，转正全量')
+  if (!note) return
+  await store.promoteStrategy(canaryVersion.value.versionId, note)
+  await openStrategy(strategyPos.value)
+}
+async function stopCanary() {
+  if (!canaryVersion.value) return
+  const note = prompt('结束灰度并恢复基线策略？请填写回滚原因', '灰度指标异常，立即恢复基线')
+  if (!note) return
+  await store.endStrategyCanary(canaryVersion.value.versionId, note)
+  await openStrategy(strategyPos.value)
+}
+async function cancelVersion(v) {
+  const note = prompt(`确认取消策略 v${v.versionId || v.id}？可填写原因`, '发布计划变更')
+  if (!note) return
+  await store.cancelStrategy(v.versionId || v.id, note)
+  await openStrategy(strategyPos.value)
+}
+async function rollbackStrategy() {
+  const note = prompt('确认创建一个回滚版本？可恢复到上一稳定版本或默认策略', '紧急回滚异常策略')
+  if (!note) return
+  const versionId = canaryVersion.value ? (canaryVersion.value.baseVersionId || 0) : (stableVersion.value?.versionId || 0)
+  await store.rollbackStrategy(strategyPos.value.id, { version_id: versionId, note })
+  await openStrategy(strategyPos.value)
 }
 
 function openNew() {
@@ -113,11 +171,16 @@ function submit() {
           <span>经验 {{ p.years }} 年+</span><span>编制 {{ p.slots }}</span><span>应聘 {{ appCount(p.id) }}</span>
         </div>
         <div class="stline">
-          <span class="st-tag" :class="{ custom: !!p.strategy }">
-            {{ p.strategy ? `⚙️ 定制策略 ${lastVersionOf(p.id) ? `v${lastVersionOf(p.id).id}` : ''}` : '⚙️ 默认匹配策略 v0' }}
+          <span class="st-tag" :class="lastVersionOf(p.id)?.status || 'default'">
+            <template v-if="lastVersionOf(p.id)">
+              ⚙️ {{ strategyStatusMeta[lastVersionOf(p.id).status]?.[0] || `策略 v${lastVersionOf(p.id).id}` }}
+            </template>
+            <template v-else>⚙️ 默认匹配策略 v0</template>
           </span>
           <span class="muted st-w" v-if="lastVersionOf(p.id)">
+            v{{ lastVersionOf(p.id).id }} ·
             技{{ Math.round(lastVersionOf(p.id).weights.skill * 100) }}% · 薪{{ Math.round(lastVersionOf(p.id).weights.salary * 100) }}% · 词+{{ lastVersionOf(p.id).keyword_cap }}
+            <em v-if="lastVersionOf(p.id).canary_percent"> · 灰度{{ lastVersionOf(p.id).canary_percent }}%</em>
           </span>
         </div>
         <div class="acts">
@@ -173,8 +236,16 @@ function submit() {
       <div class="modal-box card">
         <h3>⚙️ 匹配策略 · {{ strategyPos?.name }}</h3>
         <div class="st-tip muted">
-          配置该职位的人岗评分权重并发布，发布后立即批量重算该职位的推荐结果；
-          <b>已投递候选人的投递时评分不受影响</b>。
+          发布将生成不可变策略版本。默认提交用人经理审批；到生效窗口后联动批量重算。
+          灰度期间按候选人稳定分桶路由，<b>投递与阶段评分快照永不改变</b>，转正/回滚均创建可审计批次。
+        </div>
+        <div v-if="canaryVersion" class="canary-banner">
+          <b>🧪 当前灰度 v{{ canaryVersion.versionId }}（{{ canaryVersion.canaryPercent }}%）</b>
+          <span>观察截止：{{ fmtTime(canaryVersion.canaryEndAt) || '未设置' }} · 基线 v{{ canaryVersion.baseVersionId || 0 }}</span>
+          <div class="acts">
+            <button class="succ" @click="promoteCanary">✅ 转正全量</button>
+            <button class="warn" @click="stopCanary">↩️ 结束灰度/回基线</button>
+          </div>
         </div>
         <div class="st-form">
           <div class="st-row" v-for="d in DIM_META" :key="d.k">
@@ -187,15 +258,34 @@ function submit() {
             <input type="range" min="0" max="10" step="1" v-model.number="strategyForm.keyword_cap" />
             <b>+{{ strategyForm.keyword_cap }}</b>
           </div>
+          <div class="st-window">
+            <label>生效开始<input type="datetime-local" v-model="strategyAdvanced.active_at"></label>
+            <label>灰度比例（0=稳定发布）<input type="number" min="0" max="100" step="5" v-model.number="strategyAdvanced.canary_percent"></label>
+            <label>灰度截止<input type="datetime-local" v-model="strategyAdvanced.canary_end_at" :disabled="!strategyAdvanced.canary_percent || strategyAdvanced.canary_percent >= 100"></label>
+            <label>策略失效时间（可选）<input type="datetime-local" v-model="strategyAdvanced.expire_at"></label>
+          </div>
+          <label class="note-label">变更说明 / 审批备注<input v-model="strategyAdvanced.change_note" placeholder="如：提高技能权重以降低误筛；灰度观察通过率"></label>
+          <label class="direct-line"><input type="checkbox" v-model="strategyAdvanced.direct"> 紧急直发（跳过审批；历史调用兼容，生产建议保留审批）</label>
         </div>
         <div class="st-sum" :class="{ ok: weightSumPct === 1, bad: weightSumPct !== 1 }">
           权重合计 {{ Math.round(weightSumPct * 100) }}%
           <em v-if="weightSumPct !== 1">（发布时将自动归一化为 100%）</em>
         </div>
         <div v-if="strategyMsg" class="st-msg">✅ {{ strategyMsg }}</div>
+        <div class="version-history" v-if="strategyVersionsData.length">
+          <div v-if="canaryVersion" class="vh-head"><b>版本治理记录</b><button class="ghost tiny" @click="rollbackStrategy">紧急回滚基线</button></div>
+          <div v-else class="vh-head"><b>版本治理记录</b><span class="muted">无灰度时可从历史版本另行回滚</span></div>
+          <div v-for="v in strategyVersionsData.slice(0, 6)" :key="v.versionId" class="vh-row">
+            <span class="ver">v{{ v.versionId }}</span>
+            <span class="state">{{ strategyStatusMeta[v.status]?.[0] || v.status }}</span>
+            <span class="muted">{{ fmtTime(v.activeAt || v.publishedAt) }}</span>
+            <em v-if="v.canaryPercent">灰度{{ v.canaryPercent }}%</em>
+            <button v-if="['pending_approval','scheduled'].includes(v.status)" class="ghost tiny" @click="cancelVersion(v)">取消</button>
+          </div>
+        </div>
         <div class="acts">
-          <button class="primary" :disabled="strategySaving" @click="submitStrategy(false)">发布并重算推荐</button>
-          <button class="warn" :disabled="strategySaving" @click="submitStrategy(true)">恢复默认</button>
+          <button class="primary" :disabled="strategySaving" @click="submitStrategy(false)">提交版本发布</button>
+          <button class="warn" :disabled="strategySaving" @click="submitStrategy(true)">恢复默认并提交</button>
           <button class="ghost" @click="strategyOpen = false">关闭</button>
         </div>
       </div>
@@ -243,4 +333,20 @@ function submit() {
 .st-sum.bad { color: var(--accent2); }
 .st-sum em { font-style: normal; font-size: 11px; color: var(--muted); }
 .st-msg { margin-bottom: 10px; font-size: 12px; color: var(--green); }
+.st-tag.active { background: rgba(87,214,160,.15); color: var(--green); border-color: rgba(87,214,160,.4); }
+.st-tag.canary { background: rgba(255,209,102,.13); color: var(--accent2); border-color: rgba(255,209,102,.42); }
+.st-tag.pending_approval, .st-tag.scheduled, .st-tag.returned { background: rgba(91,140,255,.13); color: var(--accent); border-color: rgba(91,140,255,.35); }
+.st-tag.retired, .st-tag.cancelled, .st-tag.canary_ended, .st-tag.rolled_back { color: var(--muted); }
+.st-window { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin: 12px 0; }
+.st-window label, .note-label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.st-window input, .note-label input { padding: 7px 8px; }
+.note-label { margin-bottom: 8px; }
+.direct-line { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--accent2); }
+.canary-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 9px 10px; margin: 10px 0; border: 1px solid rgba(255,209,102,.35); border-radius: 8px; background: rgba(255,209,102,.08); font-size: 12px; }
+.canary-banner .acts { margin-left: auto; }
+.version-history { border-top: 1px dashed var(--border); padding-top: 10px; margin-bottom: 10px; }
+.vh-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 12px; }
+.vh-row { display: grid; grid-template-columns: 44px 92px 1fr auto auto; gap: 8px; align-items: center; font-size: 11px; padding: 4px 0; }
+.vh-row em { font-style: normal; color: var(--accent2); }
+.tiny { padding: 2px 7px; font-size: 11px; }
 </style>

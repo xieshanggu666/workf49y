@@ -78,6 +78,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
           <button class="warn" :disabled="recomputing" @click="recomputeAll">
             {{ recomputing ? '重算中…' : '🔁 按策略批量重算全部推荐' }}
           </button>
+          <button class="ghost" @click="store.sweepStrategies">⏰ 扫描生效窗口</button>
           <em v-if="recomputeMsg" class="recalc-msg">{{ recomputeMsg }}</em>
         </span>
       </div>
@@ -91,7 +92,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
         <div>
           <h3>{{ result.position.name }} <span class="tag">{{ result.position.dept }} · {{ result.position.city }}</span></h3>
           <div class="muted">薪资 ¥{{ result.position.salary_min }}K-{{ result.position.salary_max }}K · 经验 {{ result.position.years }}年+</div>
-          <div class="st-badge" :class="{ custom: result.strategy && !result.strategy.isDefault }" :title="strategyTitle(result.strategy)">
+          <div class="st-badge" :class="{ custom: result.strategy && !result.strategy.isDefault, canary: result.strategy?.canaryVersion }" :title="strategyTitle(result.strategy)">
             ⚙️ {{ result.strategy?.isDefault === false ? '职位定制策略' : '默认匹配策略' }}
             <b class="ver-id">{{ result.strategy?.versionId ? `v${result.strategy.versionId}` : 'v0' }}</b>：
             技{{ Math.round((result.strategy?.weights.skill ?? 0.4) * 100) }}% ·
@@ -99,6 +100,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
             薪{{ Math.round((result.strategy?.weights.salary ?? 0.15) * 100) }}% ·
             学历{{ Math.round((result.strategy?.weights.edu ?? 0.15) * 100) }}% ·
             城{{ Math.round((result.strategy?.weights.city ?? 0.1) * 100) }}%
+            <em v-if="result.strategy?.canaryVersion"> · 🧪 灰度{{ result.strategy.canaryVersion.canaryPercent }}%（v{{ result.strategy.canaryVersion.versionId }}）</em>
           </div>
         </div>
         <div class="req-chips"><span class="skill-chip" v-for="s in result.position.skills" :key="s.k">{{ s.k }} x{{ s.w }}</span></div>
@@ -110,7 +112,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
           <div class="rank">{{ i + 1 }}</div>
           <div class="score" :class="scoreClass(m.score)">{{ m.score }}</div>
           <div class="body">
-            <div class="nm">{{ m.name }} <span class="tag" v-if="m.score >= 75">高匹配</span></div>
+            <div class="nm">{{ m.name }} <span class="tag" v-if="m.score >= 75">高匹配</span><span class="canary-chip" v-if="m.in_canary">🧪 灰度桶 #{{ m.canary_bucket }}</span></div>
             <div class="sub muted">{{ m.years }}年 · {{ m.edu }} · {{ m.city }} · 期望¥{{ m.exp_salary.toLocaleString() }}</div>
             <div class="chips"><span class="skill-chip" v-for="s in m.skills" :key="s.k">{{ s.k }}</span></div>
             <div class="reason">
@@ -145,7 +147,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
           <div class="rank">{{ i + 1 }}</div>
           <div class="score" :class="scoreClass(m.score)">{{ m.score }}</div>
           <div class="body">
-            <div class="nm">{{ m.name }} <span class="tag">{{ m.dept }}</span></div>
+            <div class="nm">{{ m.name }} <span class="tag">{{ m.dept }}</span><span class="canary-chip" v-if="m.in_canary">🧪 灰度桶 #{{ m.canary_bucket }}</span></div>
             <div class="sub muted">{{ m.city }} · {{ m.level }} · ¥{{ m.salary_min }}K-{{ m.salary_max }}K</div>
             <div class="reason">
               <div v-for="d in m.dims" :key="d.k" class="dim">
@@ -180,6 +182,9 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
 .recalc-msg { font-style: normal; font-size: 12px; color: var(--green); }
 .st-badge { margin-top: 6px; font-size: 11px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 3px 8px; display: inline-block; }
 .st-badge.custom { color: var(--purple); border-color: rgba(167,139,250,.4); background: rgba(167,139,250,.1); }
+.st-badge.canary { color: var(--accent2); border-color: rgba(255,209,102,.45); background: rgba(255,209,102,.09); }
+.st-badge em { font-style: normal; color: var(--accent2); }
+.canary-chip { font-size: 10px; border: 1px solid rgba(255,209,102,.45); color: var(--accent2); background: rgba(255,209,102,.1); border-radius: 9px; padding: 1px 6px; }
 .ver-id { color: var(--accent2); margin: 0 2px; font-style: normal; }
 .result-head { display: flex; align-items: center; gap: 20px; justify-content: space-between; flex-wrap: wrap; }
 .h-metric { text-align: center; }
